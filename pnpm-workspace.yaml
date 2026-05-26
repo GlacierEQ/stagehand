@@ -1,6 +1,7 @@
 packages:
-  - "./"
-  - "lib"
-  - "examples"
-  - "evals"
-  - "docs"
+  - "packages/core"
+  - "packages/cli"
+  - "packages/evals"
+  - "packages/docs"
+  - "packages/server-v3"
+  - "packages/server-v4"

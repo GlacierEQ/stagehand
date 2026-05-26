@@ -3,6 +3,7 @@
   "commit": false,
   "fixed": [],
   "linked": [],
+  "ignore": [],
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
   "access": "public",
