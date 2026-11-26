@@ -1,0 +1,242 @@
+import type { DomainPolicy } from "@browserbasehq/stagehand-protocol/types";
+
+type DomainRule = { type: "exact"; hostname: string } | { type: "wildcard"; hostname: string };
+
+export type NormalizedDomainPolicy = {
+  allowedDomains: string[];
+  blockedDomains: string[];
+  allowedDomainRules: DomainRule[];
+  blockedDomainRules: DomainRule[];
+};
+
+export type DomainPolicyDecision =
+  | { action: "continue" }
+  | { action: "block"; reason: "allowedDomains" | "blockedDomains" };
+
+const DOMAIN_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+type DomainPolicyKey = "allowedDomains" | "blockedDomains";
+
+function canonicalizeHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/\.+$/, "");
+}
+
+function validateHostname(
+  hostname: string,
+  original: string,
+  kind: "allowedDomains" | "blockedDomains",
+): void {
+  const label = kind === "allowedDomains" ? "allowed" : "blocked";
+
+  if (!hostname || hostname.length > 253) {
+    throw new TypeError(`Invalid ${label} domain pattern: "${original}"`);
+  }
+
+  const labels = hostname.split(".");
+  if (labels.length < 2 || labels.some((label) => !DOMAIN_LABEL_RE.test(label))) {
+    throw new TypeError(`Invalid ${label} domain pattern: "${original}"`);
+  }
+}
+
+function normalizeDomainPattern(
+  pattern: unknown,
+  kind: "allowedDomains" | "blockedDomains",
+): DomainRule {
+  const label = kind === "allowedDomains" ? "allowed" : "blocked";
+  const capitalizedLabel = kind === "allowedDomains" ? "Allowed" : "Blocked";
+
+  if (typeof pattern !== "string") {
+    throw new TypeError(`${capitalizedLabel} domain patterns must be strings`);
+  }
+
+  const original = pattern;
+  const normalized = canonicalizeHostname(pattern.trim());
+
+  if (!normalized) {
+    throw new TypeError(`Invalid ${label} domain pattern: "${original}"`);
+  }
+
+  if (
+    normalized.includes("://") ||
+    normalized.includes("/") ||
+    normalized.includes(":") ||
+    normalized.includes("?") ||
+    normalized.includes("#")
+  ) {
+    throw new TypeError(
+      `${capitalizedLabel} domain patterns must be domain-only values: "${original}"`,
+    );
+  }
+
+  if (normalized.startsWith("*.")) {
+    const hostname = normalized.slice(2);
+    validateHostname(hostname, original, kind);
+    return { type: "wildcard", hostname };
+  }
+
+  if (normalized.includes("*")) {
+    throw new TypeError(`Wildcards are only supported as a leading "*.": "${original}"`);
+  }
+
+  validateHostname(normalized, original, kind);
+  return { type: "exact", hostname: normalized };
+}
+
+function normalizeDomainPatterns(
+  patterns: unknown[] | undefined,
+  kind: DomainPolicyKey,
+): DomainRule[] {
+  if (!patterns?.length) return [];
+
+  const rulesByKey = new Map<string, DomainRule>();
+  for (const pattern of patterns) {
+    const rule = normalizeDomainPattern(pattern, kind);
+    rulesByKey.set(`${rule.type}:${rule.hostname}`, rule);
+  }
+
+  return Array.from(rulesByKey.values());
+}
+
+function getDomainPatterns(
+  policy: DomainPolicy | null | undefined,
+  key: DomainPolicyKey,
+): string[] {
+  if (policy === null) return [];
+
+  if (policy === undefined) {
+    throw new TypeError("Domain policy must be an object or null");
+  }
+
+  const patterns = policy[key];
+  if (patterns === undefined) return [];
+
+  if (!Array.isArray(patterns)) {
+    throw new TypeError(`${key} must be an array of strings`);
+  }
+
+  return patterns;
+}
+
+function patternHost(rule: DomainRule): string {
+  return rule.type === "wildcard" ? `*.${rule.hostname}` : rule.hostname;
+}
+
+export function normalizeDomainPolicy(
+  policy: DomainPolicy | null | undefined,
+): NormalizedDomainPolicy | null {
+  const allowedDomains = getDomainPatterns(policy, "allowedDomains");
+  const blockedDomains = getDomainPatterns(policy, "blockedDomains");
+
+  if (!allowedDomains.length && !blockedDomains.length) return null;
+
+  const allowedDomainRules = normalizeDomainPatterns(allowedDomains, "allowedDomains");
+  const blockedDomainRules = normalizeDomainPatterns(blockedDomains, "blockedDomains");
+
+  return {
+    allowedDomains: allowedDomainRules.map(patternHost),
+    blockedDomains: blockedDomainRules.map(patternHost),
+    allowedDomainRules,
+    blockedDomainRules,
+  };
+}
+
+function hostnameFromHttpUrl(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return canonicalizeHostname(parsed.hostname);
+  } catch {
+    return null;
+  }
+}
+
+function matchesDomainRules(hostname: string, rules: DomainRule[]): boolean {
+  return rules.some((rule) => {
+    if (rule.type === "exact") {
+      return hostname === rule.hostname;
+    }
+    return hostname.endsWith(`.${rule.hostname}`);
+  });
+}
+
+export function getDomainPolicyDecision(
+  url: string,
+  policy: NormalizedDomainPolicy | null,
+): DomainPolicyDecision {
+  if (!policy) return { action: "continue" };
+
+  const hostname = hostnameFromHttpUrl(url);
+  if (!hostname) return { action: "continue" };
+
+  if (matchesDomainRules(hostname, policy.blockedDomainRules)) {
+    return { action: "block", reason: "blockedDomains" };
+  }
+
+  if (
+    policy.allowedDomainRules.length &&
+    !matchesDomainRules(hostname, policy.allowedDomainRules)
+  ) {
+    return { action: "block", reason: "allowedDomains" };
+  }
+
+  return { action: "continue" };
+}
+
+export function toDomainPolicyDnrRules(
+  policy: NormalizedDomainPolicy | null,
+): chrome.declarativeNetRequest.Rule[] {
+  if (!policy) return [];
+
+  const rules: chrome.declarativeNetRequest.Rule[] = [];
+  const addRule = (type: "allow" | "block", priority: number, regexFilter: string): void => {
+    rules.push({
+      id: rules.length + 1,
+      priority,
+      action: { type },
+      condition: {
+        regexFilter,
+        isUrlFilterCaseSensitive: false,
+        // Chrome treats an empty exclusion list as omitted, which excludes
+        // main_frame. Explicitly include navigations as well as subresources.
+        resourceTypes: [
+          "main_frame",
+          "sub_frame",
+          "stylesheet",
+          "script",
+          "image",
+          "font",
+          "object",
+          "xmlhttprequest",
+          "ping",
+          "csp_report",
+          "media",
+          "websocket",
+          "webtransport",
+          "webbundle",
+          "other",
+        ],
+      },
+    });
+  };
+
+  // Allow rules only exempt their matching request, not the frame's future requests.
+  // Explicit blocks must outrank allows, which outrank the allowlist's default block.
+  if (policy.allowedDomainRules.length) {
+    addRule("block", 1, "^https?://");
+    for (const rule of policy.allowedDomainRules) {
+      addRule("allow", 2, domainRuleDnrRegex(rule));
+    }
+  }
+  for (const rule of policy.blockedDomainRules) {
+    addRule("block", 3, domainRuleDnrRegex(rule));
+  }
+
+  return rules;
+}
+
+function domainRuleDnrRegex(rule: DomainRule): string {
+  const hostname = rule.hostname.replace(/\./g, "\\.");
+  const subdomain = rule.type === "wildcard" ? "[^/?#@:]*\\." : "";
+  return `^https?://([^/?#@]*@)?${subdomain}${hostname}\\.*(:[0-9]+)?(/|$)`;
+}

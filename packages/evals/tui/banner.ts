@@ -1,22 +1,18 @@
-/**
- * ASCII art banner for REPL mode.
- *
- * Pure ASCII output — the tip line that used to live here is now
- * `printTipLine()` in tui/welcome.ts so the REPL can choose between
- * "extended welcome" (first-run) and "banner + tip" (returning user).
- */
-
 import { c } from "./format.js";
 
-const BANNER_ART = `
-${c.bbBold}███████╗██╗   ██╗ █████╗ ██╗     ███████╗${c.reset}
-${c.bbBold}██╔════╝██║   ██║██╔══██╗██║     ██╔════╝${c.reset}
-${c.bbBold}█████╗  ██║   ██║███████║██║     ███████╗${c.reset}
-${c.bbBold}██╔══╝  ╚██╗ ██╔╝██╔══██║██║     ╚════██║${c.reset}
-${c.bbBold}███████╗ ╚████╔╝ ██║  ██║███████╗███████║${c.reset}
-${c.bbBold}╚══════╝  ╚═══╝  ╚═╝  ╚═╝╚══════╝╚══════╝${c.reset}
-`;
+export const BANNER_LINES = [
+  "███████╗██╗   ██╗ █████╗ ██╗     ███████╗",
+  "██╔════╝██║   ██║██╔══██╗██║     ██╔════╝",
+  "█████╗  ██║   ██║███████║██║     ███████╗",
+  "██╔══╝  ╚██╗ ██╔╝██╔══██║██║     ╚════██║",
+  "███████╗ ╚████╔╝ ██║  ██║███████╗███████║",
+  "╚══════╝  ╚═══╝  ╚═╝  ╚═╝╚══════╝╚══════╝",
+];
+
+export const BANNER_W = BANNER_LINES[0].length;
 
 export function printBanner(): void {
-  console.log(BANNER_ART);
+  console.log("");
+  for (const line of BANNER_LINES) console.log(`${c.bbBold}${line}${c.reset}`);
+  console.log("");
 }

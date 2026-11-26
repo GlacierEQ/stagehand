@@ -1,0 +1,922 @@
+import { FrameChainResolver } from "../../frameChainResolver.js";
+import type { Protocol } from "devtools-protocol";
+import type { LocatorInput } from "@browserbasehq/stagehand-protocol/types";
+import type { CDPSessionLike } from "../../cdp.js";
+import { Page } from "../../page.js";
+import { Frame } from "../../frame.js";
+import { type Progress, runLocatorStep } from "../../progress.js";
+import {
+  FrameSelectorResolver,
+  type ResolvedNode,
+  type SelectorQuery,
+} from "../../selectorResolver.js";
+import type { StagehandLogger } from "../../../logger.js";
+import type {
+  FrameContext,
+  FrameDomMaps,
+  FrameParentIndex,
+  HybridSnapshot,
+  SnapshotOptions,
+  SessionDomIndex,
+} from "../../../types/private/index.js";
+import { a11yForFrame } from "./a11yTree.js";
+import {
+  resolveCssFocusFrameAndTail,
+  resolveFocusFrameAndTail,
+  listChildrenOf,
+} from "./focusSelectors.js";
+import { buildSessionDomIndex, domMapsForSession, relativizeXPath } from "./domTree.js";
+import { injectSubtrees } from "./treeFormatUtils.js";
+import { ownerSession, parentSession } from "./sessions.js";
+import { normalizeXPath, prefixXPath } from "./xpathUtils.js";
+
+type IgnoredNodeMap = Map<string, Set<number>>;
+type Interval = { start: number; end: number };
+type ExclusionIntervalsByFrame = Map<string, Interval[]>;
+type ChildFrameHost = { childFrameId: string; hostBackendNodeId: number };
+type ChildFramesByParent = Map<string, ChildFrameHost[]>;
+type StringWithToWellFormed = string & { toWellFormed(): string };
+
+const toWellFormed = (value: string): string => (value as StringWithToWellFormed).toWellFormed();
+
+export async function captureHybridSnapshot(
+  page: Page,
+  options: SnapshotOptions | undefined,
+  progress: Progress,
+  logger: StagehandLogger = page.logger,
+): Promise<HybridSnapshot> {
+  progress.throwIfStopped();
+  const pierce = options?.pierceShadow ?? true;
+  const includeIframes = options?.includeIframes !== false;
+  const hasIgnoreLocators = (options?.ignoreLocators?.length ?? 0) > 0;
+
+  const context = buildFrameContext(page);
+  const framesInScope = includeIframes ? [...context.frames] : [context.rootId];
+  if (!framesInScope.includes(context.rootId)) {
+    framesInScope.unshift(context.rootId);
+  }
+
+  if (!hasIgnoreLocators) {
+    const scopedSnapshot = await tryScopedSnapshot(
+      page,
+      options,
+      context,
+      pierce,
+      new Map<string, SessionDomIndex>(),
+      new Map(),
+      logger,
+      progress,
+    );
+    if (scopedSnapshot) return scopedSnapshot;
+  }
+
+  const sessionToIndex = await buildSessionIndexes(page, framesInScope, pierce, progress);
+  const ignoredNodesByFrame = await resolveIgnoredNodes(
+    page,
+    options?.ignoreLocators,
+    context,
+    sessionToIndex,
+    progress,
+  );
+  const exclusionIntervalsByFrame = await buildFrameExclusionIntervals(
+    page,
+    context,
+    sessionToIndex,
+    ignoredNodesByFrame,
+    progress,
+  );
+  if (hasIgnoreLocators) {
+    const scopedSnapshot = await tryScopedSnapshot(
+      page,
+      options,
+      context,
+      pierce,
+      sessionToIndex,
+      exclusionIntervalsByFrame,
+      logger,
+      progress,
+    );
+    if (scopedSnapshot) return scopedSnapshot;
+  }
+
+  const { perFrameMaps, perFrameOutlines } = await collectPerFrameMaps(
+    page,
+    context,
+    sessionToIndex,
+    options,
+    pierce,
+    framesInScope,
+    exclusionIntervalsByFrame,
+    progress,
+  );
+  const { absPrefix, iframeHostEncByChild } = await computeFramePrefixes(
+    page,
+    context,
+    perFrameMaps,
+    framesInScope,
+    progress,
+  );
+
+  progress.throwIfStopped();
+  return mergeFramesIntoSnapshot(
+    context,
+    perFrameMaps,
+    perFrameOutlines,
+    absPrefix,
+    iframeHostEncByChild,
+    framesInScope,
+  );
+}
+
+export function buildFrameContext(page: Page): FrameContext {
+  const rootId = page.mainFrameId();
+  const frameTree = page.asProtocolFrameTree(rootId);
+  const parentByFrame: FrameParentIndex = new Map();
+  (function index(n: Protocol.Page.FrameTree, parent: string | null) {
+    parentByFrame.set(n.frame.id, parent);
+    for (const c of n.childFrames ?? []) index(c, n.frame.id);
+  })(frameTree, null);
+  const frames = page.listAllFrameIds();
+  return { rootId, parentByFrame, frames };
+}
+
+export async function tryScopedSnapshot(
+  page: Page,
+  options: SnapshotOptions | undefined,
+  context: FrameContext,
+  pierce: boolean,
+  sessionToIndex: Map<string, SessionDomIndex>,
+  exclusionIntervalsByFrame: ExclusionIntervalsByFrame,
+  logger: StagehandLogger,
+  progress?: Progress,
+): Promise<HybridSnapshot | null> {
+  progress?.throwIfStopped();
+  const focusLocator = options?.focusLocator;
+  if (!focusLocator) return null;
+  const requestedFocus = "selector" in focusLocator ? focusLocator.selector.trim() : "";
+  if (!requestedFocus && !("chain" in focusLocator)) return null;
+  const focusNth = "nth" in focusLocator ? focusLocator.nth : undefined;
+
+  const logScopeFallback = () => {
+    logger.warn("Unable to narrow scope with locator; falling back to the full DOM", {
+      locator: focusLocator,
+    });
+  };
+
+  try {
+    let targetFrameId: string;
+    let tailSelector: string | undefined;
+    let absPrefix: string | undefined;
+    let focusBackendNodeId: number | undefined;
+    let focusSession: CDPSessionLike | undefined;
+
+    const looksLikeXPath = /^xpath=/i.test(requestedFocus) || requestedFocus.startsWith("/");
+    if ("chain" in focusLocator) {
+      const result = await new FrameChainResolver(page, undefined, {
+        readinessRetries: "none",
+      }).resolve(focusLocator.chain, { mode: "selected", index: 0 }, progress);
+      if (result.mode === "count" || !result.targets.length)
+        throw new Error("Locator chain scope did not match an element");
+      const target = result.targets[0];
+      targetFrameId = target.frameId;
+      focusBackendNodeId = target.backendNodeId;
+      focusSession = target.session;
+      absPrefix = await chainFramePrefix(page, context, targetFrameId, pierce, progress);
+    } else if (looksLikeXPath) {
+      const focus = normalizeXPath(requestedFocus);
+      const hit = await resolveFocusFrameAndTail(
+        page,
+        focus,
+        context.parentByFrame,
+        context.rootId,
+        progress,
+      );
+      targetFrameId = hit.targetFrameId;
+      tailSelector = hit.tailXPath || undefined;
+      absPrefix = hit.absPrefix;
+    } else {
+      const cssHit = await resolveCssFocusFrameAndTail(
+        page,
+        requestedFocus,
+        context.parentByFrame,
+        context.rootId,
+        progress,
+      );
+      targetFrameId = cssHit.targetFrameId;
+      tailSelector = cssHit.tailSelector || undefined;
+      absPrefix = cssHit.absPrefix;
+    }
+
+    const owningSess = focusSession ?? ownerSession(page, targetFrameId);
+    if (focusSession && ownerSession(page, targetFrameId) !== focusSession) {
+      throw new Error("Locator chain scope frame changed during capture");
+    }
+    const parentId = context.parentByFrame.get(targetFrameId);
+    const sameSessionAsParent =
+      !!parentId && ownerSession(page, parentId) === ownerSession(page, targetFrameId);
+    const { tagNameMap, xpathMap, scrollableMap } = await domMapsForSession(
+      owningSess,
+      targetFrameId,
+      pierce,
+      (fid, be) => `${page.getOrdinal(fid)}-${be}`,
+      sameSessionAsParent,
+      progress,
+    );
+
+    const { outline, urlMap, scopeApplied } = await a11yForFrame(
+      owningSess,
+      targetFrameId,
+      {
+        focusBackendNodeId,
+        focusLocator: tailSelector
+          ? {
+              selector: tailSelector,
+              ...(focusNth === undefined ? {} : { nth: focusNth }),
+            }
+          : undefined,
+        isIgnoredBackendNode: makeIsIgnoredBackendNode(
+          targetFrameId,
+          ownerSessionIndexForFrame(page, targetFrameId, sessionToIndex),
+          exclusionIntervalsByFrame,
+        ),
+        tagNameMap,
+        scrollableMap,
+        encode: (backendNodeId) => `${page.getOrdinal(targetFrameId)}-${backendNodeId}`,
+      },
+      progress,
+    );
+
+    const scopedXpathMap: Record<string, string> = {};
+    const isIgnoredBackendNode = makeIsIgnoredBackendNode(
+      targetFrameId,
+      ownerSessionIndexForFrame(page, targetFrameId, sessionToIndex),
+      exclusionIntervalsByFrame,
+    );
+    const abs = absPrefix ?? "";
+    const isRoot = !abs || abs === "/";
+    if (isRoot) {
+      for (const [encId, xp] of Object.entries(xpathMap)) {
+        const backendNodeId = parseEncodedBackendNodeId(encId);
+        if (typeof backendNodeId === "number" && isIgnoredBackendNode?.(backendNodeId)) {
+          continue;
+        }
+        scopedXpathMap[encId] = xp;
+      }
+    } else {
+      for (const [encId, xp] of Object.entries(xpathMap)) {
+        const backendNodeId = parseEncodedBackendNodeId(encId);
+        if (typeof backendNodeId === "number" && isIgnoredBackendNode?.(backendNodeId)) {
+          continue;
+        }
+        scopedXpathMap[encId] = prefixXPath(abs, xp);
+      }
+    }
+
+    const scopedUrlMap: Record<string, string> = { ...urlMap };
+
+    const wellFormedOutline = toWellFormed(outline);
+    const snapshot: HybridSnapshot = {
+      combinedTree: wellFormedOutline,
+      combinedXpathMap: scopedXpathMap,
+      combinedUrlMap: scopedUrlMap,
+      perFrame: [
+        {
+          frameId: targetFrameId,
+          outline: wellFormedOutline,
+          xpathMap,
+          urlMap,
+        },
+      ],
+    };
+
+    if (scopeApplied) {
+      return snapshot;
+    }
+
+    if ("chain" in focusLocator)
+      throw new Error("Unable to scope accessibility tree to locator chain target");
+    logScopeFallback();
+  } catch (error) {
+    progress?.throwIfStopped();
+    if ("chain" in focusLocator) throw error;
+    logScopeFallback();
+  }
+  return null;
+}
+
+async function chainFramePrefix(
+  page: Page,
+  context: FrameContext,
+  targetFrameId: string,
+  pierce: boolean,
+  progress?: Progress,
+): Promise<string> {
+  let prefix = "";
+  let child = targetFrameId;
+  while (child !== context.rootId) {
+    const parent = context.parentByFrame.get(child);
+    if (!parent) throw new Error("Locator chain scope frame is no longer attached");
+    const session = ownerSession(page, parent);
+    const { backendNodeId } = await runLocatorStep(
+      progress,
+      "finding chain scope frame owner",
+      () =>
+        session.send<Protocol.DOM.GetFrameOwnerResponse>("DOM.getFrameOwner", { frameId: child }),
+    );
+    const grandparent = context.parentByFrame.get(parent);
+    const maps = await domMapsForSession(
+      session,
+      parent,
+      pierce,
+      (fid, be) => `${page.getOrdinal(fid)}-${be}`,
+      !!grandparent && ownerSession(page, grandparent) === session,
+      progress,
+    );
+    const host = maps.xpathMap[`${page.getOrdinal(parent)}-${backendNodeId}`];
+    if (!host) throw new Error("Unable to locate chain scope iframe in the snapshot");
+    prefix = prefix ? prefixXPath(host, prefix) : host;
+    child = parent;
+  }
+  return prefix;
+}
+
+export async function buildSessionIndexes(
+  page: Page,
+  frames: string[],
+  pierce: boolean,
+  progress?: Progress,
+): Promise<Map<string, SessionDomIndex>> {
+  const sessionToIndex = new Map<string, SessionDomIndex>();
+  const sessionById = new Map<string, CDPSessionLike>();
+  for (const frameId of frames) {
+    progress?.throwIfStopped();
+    const sess = ownerSession(page, frameId);
+    const sid = sess.id ?? "root";
+    if (!sessionById.has(sid)) sessionById.set(sid, sess);
+  }
+  for (const [sid, sess] of sessionById.entries()) {
+    progress?.throwIfStopped();
+    const idx = await buildSessionDomIndex(sess, pierce, progress);
+    sessionToIndex.set(sid, idx);
+  }
+  return sessionToIndex;
+}
+
+export async function collectPerFrameMaps(
+  page: Page,
+  context: FrameContext,
+  sessionToIndex: Map<string, SessionDomIndex>,
+  options: SnapshotOptions | undefined,
+  pierce: boolean,
+  frameIds: string[],
+  exclusionIntervalsByFrame: ExclusionIntervalsByFrame,
+  progress?: Progress,
+): Promise<{
+  perFrameMaps: Map<string, FrameDomMaps>;
+  perFrameOutlines: Array<{ frameId: string; outline: string }>;
+}> {
+  const perFrameMaps = new Map<string, FrameDomMaps>();
+  const perFrameOutlines: Array<{ frameId: string; outline: string }> = [];
+
+  for (const frameId of frameIds) {
+    progress?.throwIfStopped();
+    const sess = ownerSession(page, frameId);
+    const sid = sess.id ?? "root";
+    let idx = sessionToIndex.get(sid);
+    if (!idx) {
+      idx = await buildSessionDomIndex(sess, pierce, progress);
+      sessionToIndex.set(sid, idx);
+    }
+
+    const parentId = context.parentByFrame.get(frameId);
+    const sameSessionAsParent = !!parentId && ownerSession(page, parentId) === sess;
+
+    const docRootBe = await resolveFrameDocRootBackendId(
+      page,
+      frameId,
+      idx,
+      sameSessionAsParent,
+      progress,
+    );
+    if (docRootBe === undefined) continue;
+
+    const tagNameMap: Record<string, string> = {};
+    const xpathMap: Record<string, string> = {};
+    const scrollableMap: Record<string, boolean> = {};
+    const isExcluded = makeIsIgnoredBackendNode(frameId, idx, exclusionIntervalsByFrame);
+    const isIgnoredBackendNode = (backendId: number): boolean =>
+      isExcluded?.(backendId) === true || (!pierce && idx.docRootOf.get(backendId) !== docRootBe);
+    const enc = (be: number) => `${page.getOrdinal(frameId)}-${be}`;
+    const baseAbs = idx.absByBe.get(docRootBe) ?? "/";
+
+    for (const [be, nodeAbs] of idx.absByBe.entries()) {
+      const nodeDocRoot = idx.docRootOf.get(be);
+      if (nodeDocRoot !== docRootBe) continue;
+      if (isIgnoredBackendNode?.(be)) continue;
+
+      const rel = relativizeXPath(baseAbs, nodeAbs);
+      const key = enc(be);
+      xpathMap[key] = rel;
+      const tag = idx.tagByBe.get(be);
+      if (tag) tagNameMap[key] = tag;
+      if (idx.scrollByBe.get(be)) scrollableMap[key] = true;
+    }
+
+    const { outline, urlMap } = await a11yForFrame(
+      sess,
+      frameId,
+      {
+        isIgnoredBackendNode,
+        tagNameMap,
+        scrollableMap,
+        encode: (backendNodeId) => `${page.getOrdinal(frameId)}-${backendNodeId}`,
+      },
+      progress,
+    );
+
+    perFrameOutlines.push({ frameId, outline });
+    perFrameMaps.set(frameId, { tagNameMap, xpathMap, scrollableMap, urlMap });
+  }
+
+  return { perFrameMaps, perFrameOutlines };
+}
+
+export async function resolveIgnoredNodes(
+  page: Page,
+  ignoreLocators: LocatorInput[] | undefined,
+  context: FrameContext,
+  sessionToIndex: Map<string, SessionDomIndex>,
+  progress?: Progress,
+): Promise<IgnoredNodeMap> {
+  const ignoredNodesByFrame: IgnoredNodeMap = new Map();
+
+  for (const locator of ignoreLocators ?? []) {
+    progress?.throwIfStopped();
+    const selector = "selector" in locator ? locator.selector.trim() : undefined;
+    if (selector === "") continue;
+
+    try {
+      const resolved = await resolveIgnoredNodesForLocator(
+        page,
+        "chain" in locator ? locator : { ...locator, selector: selector! },
+        context,
+        sessionToIndex,
+        progress,
+      );
+      for (const match of resolved) {
+        const nodes = ignoredNodesByFrame.get(match.frameId) ?? new Set<number>();
+        nodes.add(match.backendNodeId);
+        ignoredNodesByFrame.set(match.frameId, nodes);
+      }
+    } catch (error) {
+      progress?.throwIfStopped();
+      if ("chain" in locator) throw error;
+      continue;
+    }
+  }
+
+  return ignoredNodesByFrame;
+}
+
+async function resolveIgnoredNodesForLocator(
+  page: Page,
+  locator: LocatorInput,
+  context: FrameContext,
+  sessionToIndex: Map<string, SessionDomIndex>,
+  progress?: Progress,
+): Promise<Array<{ frameId: string; backendNodeId: number }>> {
+  if ("chain" in locator) {
+    const result = await new FrameChainResolver(page, undefined, {
+      readinessRetries: "none",
+    }).resolve(locator.chain, { mode: "all" }, progress);
+    if (result.mode === "count") throw new Error("Expected chain exclusion targets");
+    return result.targets;
+  }
+  const selector = locator.selector;
+  const looksLikeXPath = /^xpath=/i.test(selector) || selector.startsWith("/");
+
+  if (looksLikeXPath) {
+    const hit = await resolveFocusFrameAndTail(
+      page,
+      normalizeXPath(selector),
+      context.parentByFrame,
+      context.rootId,
+      progress,
+    );
+    const targetFrameId = hit.targetFrameId;
+    const tailXPath = hit.tailXPath || "/";
+    if (tailXPath === "/") {
+      const idx = ownerSessionIndexForFrame(page, targetFrameId, sessionToIndex);
+      if (!idx) return [];
+      const parentId = context.parentByFrame.get(targetFrameId);
+      const sameSessionAsParent =
+        !!parentId && ownerSession(page, parentId) === ownerSession(page, targetFrameId);
+      const backendNodeId = await resolveFrameDocRootBackendId(
+        page,
+        targetFrameId,
+        idx,
+        sameSessionAsParent,
+        progress,
+      );
+      if (backendNodeId === undefined) return [];
+      return [{ frameId: targetFrameId, backendNodeId }];
+    }
+    return resolveIgnoredNodesInFrame(
+      page,
+      targetFrameId,
+      {
+        kind: "xpath",
+        value: tailXPath,
+      },
+      locator.nth,
+      progress,
+    );
+  }
+
+  const hit = await resolveCssFocusFrameAndTail(
+    page,
+    selector,
+    context.parentByFrame,
+    context.rootId,
+    progress,
+  );
+  const targetFrameId = hit.targetFrameId;
+  return resolveIgnoredNodesInFrame(
+    page,
+    targetFrameId,
+    {
+      kind: "css",
+      value: hit.tailSelector || selector,
+    },
+    locator.nth,
+    progress,
+  );
+}
+
+async function resolveIgnoredNodesInFrame(
+  page: Page,
+  frameId: string,
+  query: SelectorQuery,
+  nth: number | undefined,
+  progress?: Progress,
+): Promise<Array<{ frameId: string; backendNodeId: number }>> {
+  const session = ownerSession(page, frameId);
+  const frame = new Frame(session, frameId, "", false, page.logger);
+  const resolver = new FrameSelectorResolver(frame, { readinessRetries: "none" });
+  const batch = await resolver.resolveAll(
+    query,
+    nth === undefined ? {} : { start: nth, limit: 1 },
+    progress,
+  );
+  try {
+    const backendNodeIds = await describeResolvedNodes(session, batch.nodes, progress);
+    return backendNodeIds.map((backendNodeId) => ({ frameId, backendNodeId }));
+  } finally {
+    await batch.release();
+    progress?.throwIfStopped();
+  }
+}
+
+async function describeResolvedNodes(
+  session: CDPSessionLike,
+  resolvedNodes: ResolvedNode[],
+  progress?: Progress,
+): Promise<number[]> {
+  const backendNodeIds = new Set<number>();
+
+  for (const resolvedNode of resolvedNodes) {
+    const desc = await runLocatorStep(progress, "reading ignored snapshot nodes", () =>
+      session.send<Protocol.DOM.DescribeNodeResponse>("DOM.describeNode", {
+        objectId: resolvedNode.objectId,
+      }),
+    );
+    const backendNodeId = desc.node.backendNodeId;
+    if (typeof backendNodeId === "number") backendNodeIds.add(backendNodeId);
+  }
+
+  progress?.throwIfStopped();
+  return [...backendNodeIds];
+}
+
+export async function buildFrameExclusionIntervals(
+  page: Page,
+  context: FrameContext,
+  sessionToIndex: Map<string, SessionDomIndex>,
+  ignoredNodesByFrame: IgnoredNodeMap,
+  progress?: Progress,
+): Promise<ExclusionIntervalsByFrame> {
+  const intervalsByFrame: ExclusionIntervalsByFrame = new Map();
+  if (!ignoredNodesByFrame.size) return intervalsByFrame;
+  const childFramesByParent = await resolveChildFramesByParent(page, context, progress);
+  const excludedFrames = new Set<string>();
+
+  const pushInterval = (frameId: string, start: number, end: number) => {
+    const intervals = intervalsByFrame.get(frameId) ?? [];
+    intervals.push({ start, end });
+    intervalsByFrame.set(frameId, intervals);
+  };
+
+  const excludeFrameSubtree = async (frameId: string): Promise<void> => {
+    progress?.throwIfStopped();
+    if (excludedFrames.has(frameId)) return;
+    excludedFrames.add(frameId);
+
+    const idx = ownerSessionIndexForFrame(page, frameId, sessionToIndex);
+    if (!idx) return;
+    const parentId = context.parentByFrame.get(frameId);
+    const sameSessionAsParent =
+      !!parentId && ownerSession(page, parentId) === ownerSession(page, frameId);
+    const docRootBe = await resolveFrameDocRootBackendId(
+      page,
+      frameId,
+      idx,
+      sameSessionAsParent,
+      progress,
+    );
+    if (docRootBe !== undefined) {
+      const start = idx.enterByBe.get(docRootBe);
+      const end = idx.exitByBe.get(docRootBe);
+      if (typeof start === "number" && typeof end === "number") {
+        pushInterval(frameId, start, end);
+      }
+    }
+
+    for (const childFrameId of listChildrenOf(context.parentByFrame, frameId)) {
+      await excludeFrameSubtree(childFrameId);
+    }
+  };
+
+  const excludeIgnoredNode = async (frameId: string, backendNodeId: number): Promise<void> => {
+    progress?.throwIfStopped();
+    const idx = ownerSessionIndexForFrame(page, frameId, sessionToIndex);
+    if (!idx) return;
+    const start = idx.enterByBe.get(backendNodeId);
+    const end = idx.exitByBe.get(backendNodeId);
+    if (typeof start !== "number" || typeof end !== "number") return;
+
+    pushInterval(frameId, start, end);
+    for (const childFrame of childFramesByParent.get(frameId) ?? []) {
+      const hostEnter = idx.enterByBe.get(childFrame.hostBackendNodeId);
+      if (typeof hostEnter !== "number") continue;
+      if (hostEnter < start || hostEnter > end) continue;
+      await excludeFrameSubtree(childFrame.childFrameId);
+    }
+  };
+
+  for (const [frameId, backendNodeIds] of ignoredNodesByFrame.entries()) {
+    for (const backendNodeId of backendNodeIds) {
+      await excludeIgnoredNode(frameId, backendNodeId);
+    }
+  }
+
+  for (const [frameId, intervals] of intervalsByFrame.entries()) {
+    intervals.sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged: Interval[] = [];
+    for (const interval of intervals) {
+      const prev = merged[merged.length - 1];
+      if (!prev || interval.start > prev.end) {
+        merged.push({ ...interval });
+        continue;
+      }
+      if (interval.end > prev.end) prev.end = interval.end;
+    }
+    intervalsByFrame.set(frameId, merged);
+  }
+
+  return intervalsByFrame;
+}
+
+async function resolveChildFramesByParent(
+  page: Page,
+  context: FrameContext,
+  progress?: Progress,
+): Promise<ChildFramesByParent> {
+  const childFramesByParent: ChildFramesByParent = new Map();
+
+  for (const frameId of context.frames) {
+    progress?.throwIfStopped();
+    const parentId = context.parentByFrame.get(frameId);
+    if (!parentId) continue;
+
+    const session = parentSession(page, context.parentByFrame, frameId);
+    if (!session) continue;
+
+    try {
+      const { backendNodeId } = await runLocatorStep(
+        progress,
+        "finding snapshot iframe owner",
+        () => session.send<{ backendNodeId?: number }>("DOM.getFrameOwner", { frameId }),
+      );
+      if (typeof backendNodeId !== "number") continue;
+      const childFrames = childFramesByParent.get(parentId) ?? [];
+      childFrames.push({
+        childFrameId: frameId,
+        hostBackendNodeId: backendNodeId,
+      });
+      childFramesByParent.set(parentId, childFrames);
+    } catch {
+      progress?.throwIfStopped();
+      continue;
+    }
+  }
+
+  return childFramesByParent;
+}
+
+function makeIsIgnoredBackendNode(
+  frameId: string,
+  idx: SessionDomIndex | undefined,
+  exclusionIntervalsByFrame: ExclusionIntervalsByFrame,
+): ((backendNodeId: number) => boolean) | undefined {
+  if (!idx) return undefined;
+  const intervals = exclusionIntervalsByFrame.get(frameId);
+  if (!intervals?.length) return undefined;
+
+  return (backendNodeId: number): boolean => {
+    const enter = idx.enterByBe.get(backendNodeId);
+    if (typeof enter !== "number") return false;
+
+    let lo = 0;
+    let hi = intervals.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const interval = intervals[mid]!;
+      if (enter < interval.start) {
+        hi = mid - 1;
+      } else if (enter > interval.end) {
+        lo = mid + 1;
+      } else {
+        return true;
+      }
+    }
+    return false;
+  };
+}
+
+function parseEncodedBackendNodeId(encodedId: string): number | undefined {
+  const parts = encodedId.split("-");
+  if (parts.length !== 2) return undefined;
+  const backendNodeId = Number(parts[1]);
+  return Number.isFinite(backendNodeId) ? backendNodeId : undefined;
+}
+
+function ownerSessionIndexForFrame(
+  page: Page,
+  frameId: string,
+  sessionToIndex: Map<string, SessionDomIndex>,
+): SessionDomIndex | undefined {
+  const session = ownerSession(page, frameId);
+  return sessionToIndex.get(session.id ?? "root");
+}
+
+async function resolveFrameDocRootBackendId(
+  page: Page,
+  frameId: string,
+  idx: SessionDomIndex,
+  sameSessionAsParent: boolean,
+  progress?: Progress,
+): Promise<number | undefined> {
+  progress?.throwIfStopped();
+  if (!sameSessionAsParent) return idx.rootBackend;
+  const session = ownerSession(page, frameId);
+  try {
+    const { backendNodeId } = await runLocatorStep(progress, "finding snapshot iframe owner", () =>
+      session.send<{ backendNodeId?: number }>("DOM.getFrameOwner", {
+        frameId,
+      }),
+    );
+    if (typeof backendNodeId === "number") {
+      const docRootBe = idx.contentDocRootByIframe.get(backendNodeId);
+      if (typeof docRootBe === "number") return docRootBe;
+    }
+  } catch {
+    progress?.throwIfStopped();
+  }
+  return undefined;
+}
+
+export async function computeFramePrefixes(
+  page: Page,
+  context: FrameContext,
+  perFrameMaps: Map<string, FrameDomMaps>,
+  frameIds: string[],
+  progress?: Progress,
+): Promise<{
+  absPrefix: Map<string, string>;
+  iframeHostEncByChild: Map<string, string>;
+}> {
+  const absPrefix = new Map<string, string>();
+  const iframeHostEncByChild = new Map<string, string>();
+  absPrefix.set(context.rootId, "");
+  const included = new Set(frameIds);
+
+  const queue: string[] = [];
+  if (included.has(context.rootId)) {
+    queue.push(context.rootId);
+  }
+
+  while (queue.length) {
+    progress?.throwIfStopped();
+    const parent = queue.shift()!;
+    const parentAbs = absPrefix.get(parent)!;
+
+    for (const child of context.frames) {
+      if (!included.has(child)) continue;
+      if (context.parentByFrame.get(child) !== parent) continue;
+      queue.push(child);
+
+      const parentSess = parentSession(page, context.parentByFrame, child);
+
+      const ownerBackendNodeId = await (async () => {
+        try {
+          const { backendNodeId } = await runLocatorStep(
+            progress,
+            "finding snapshot iframe owner",
+            () =>
+              parentSess.send<{
+                backendNodeId?: number;
+              }>("DOM.getFrameOwner", { frameId: child }),
+          );
+          return backendNodeId;
+        } catch {
+          progress?.throwIfStopped();
+          return undefined;
+        }
+      })();
+
+      if (!ownerBackendNodeId) {
+        absPrefix.set(child, parentAbs);
+        continue;
+      }
+
+      const parentDom = perFrameMaps.get(parent);
+      const iframeEnc = `${page.getOrdinal(parent)}-${ownerBackendNodeId}`;
+      const iframeXPath = parentDom?.xpathMap[iframeEnc];
+
+      const childAbs = iframeXPath ? prefixXPath(parentAbs || "/", iframeXPath) : parentAbs;
+
+      absPrefix.set(child, childAbs);
+      iframeHostEncByChild.set(child, iframeEnc);
+    }
+  }
+
+  return { absPrefix, iframeHostEncByChild };
+}
+
+export function mergeFramesIntoSnapshot(
+  context: FrameContext,
+  perFrameMaps: Map<string, FrameDomMaps>,
+  perFrameOutlines: Array<{ frameId: string; outline: string }>,
+  absPrefix: Map<string, string>,
+  iframeHostEncByChild: Map<string, string>,
+  frameIds: string[],
+): HybridSnapshot {
+  const combinedXpathMap: Record<string, string> = {};
+  const combinedUrlMap: Record<string, string> = {};
+
+  for (const frameId of frameIds) {
+    const maps = perFrameMaps.get(frameId);
+    if (!maps) continue;
+
+    const abs = absPrefix.get(frameId) ?? "";
+    const isRoot = abs === "" || abs === "/";
+
+    if (isRoot) {
+      Object.assign(combinedXpathMap, maps.xpathMap);
+      Object.assign(combinedUrlMap, maps.urlMap);
+      continue;
+    }
+
+    for (const [encId, xp] of Object.entries(maps.xpathMap)) {
+      combinedXpathMap[encId] = prefixXPath(abs, xp);
+    }
+    Object.assign(combinedUrlMap, maps.urlMap);
+  }
+
+  const idToTree = new Map<string, string>();
+  for (const { frameId, outline } of perFrameOutlines) {
+    const parentEnc = iframeHostEncByChild.get(frameId);
+    if (parentEnc) idToTree.set(parentEnc, outline);
+  }
+
+  const rootOutline =
+    perFrameOutlines.find((o) => o.frameId === context.rootId)?.outline ??
+    perFrameOutlines[0]?.outline ??
+    "";
+  const combinedTree = toWellFormed(injectSubtrees(rootOutline, idToTree));
+
+  return {
+    combinedTree,
+    combinedXpathMap,
+    combinedUrlMap,
+    perFrame: perFrameOutlines.map(({ frameId, outline }) => {
+      const maps = perFrameMaps.get(frameId);
+      return {
+        frameId,
+        outline: toWellFormed(outline),
+        xpathMap: maps?.xpathMap ?? {},
+        urlMap: maps?.urlMap ?? {},
+      };
+    }),
+  };
+}

@@ -2,11 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-  isFirstRun,
-  markFirstRunComplete,
-  readWelcomeMeta,
-} from "../../tui/welcomeState.js";
+import { isFirstRun, markFirstRunComplete, readWelcomeMeta } from "../../tui/welcomeState.js";
 import { readConfig, writeConfig } from "../../tui/commands/config.js";
 
 const tempDirs: string[] = [];
@@ -16,11 +12,7 @@ function makeTempEntryDir(initial?: Record<string, unknown>): string {
   tempDirs.push(dir);
   fs.writeFileSync(
     path.join(dir, "evals.config.json"),
-    JSON.stringify(
-      { defaults: {}, benchmarks: {}, ...(initial ?? {}) },
-      null,
-      2,
-    ),
+    JSON.stringify({ defaults: {}, benchmarks: {}, ...initial }, null, 2),
   );
   return dir;
 }
@@ -52,11 +44,8 @@ describe("welcomeState", () => {
     const dir = makeTempEntryDir();
     markFirstRunComplete(dir);
     const first = readWelcomeMeta(dir).firstRunCompletedAt;
-    // small delay to ensure timestamps would differ if rewritten
     const now = Date.now();
-    while (Date.now() - now < 5) {
-      /* spin */
-    }
+    while (Date.now() - now < 5) {}
     markFirstRunComplete(dir);
     expect(readWelcomeMeta(dir).firstRunCompletedAt).toBe(first);
   });
@@ -91,7 +80,6 @@ describe("welcomeState", () => {
   it("missing config — readWelcomeMeta returns {} instead of throwing", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "evals-welcome-state-"));
     tempDirs.push(dir);
-    // No evals.config.json written
     expect(readWelcomeMeta(dir)).toEqual({});
     expect(isFirstRun(dir)).toBe(true);
   });

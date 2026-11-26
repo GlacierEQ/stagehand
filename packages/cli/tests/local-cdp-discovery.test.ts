@@ -1,190 +1,178 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { AddressInfo } from "node:net";
+
 import { afterEach, describe, expect, it } from "vitest";
-import * as http from "http";
-import * as net from "net";
-import { promises as fs } from "fs";
-import * as os from "os";
-import * as path from "path";
-import { discoverLocalCdp } from "../src/local-cdp-discovery";
 
-const cleanupPaths: string[] = [];
-const closeCallbacks: Array<() => Promise<void>> = [];
+import {
+  discoverLocalCdp,
+  resolveWsTargetFromPort,
+} from "../src/lib/driver/local-cdp-discovery.js";
 
-async function trackTempDir(prefix: string): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  cleanupPaths.push(dir);
-  return dir;
+async function startFakeCdpServer(wsPathForPort: (port: number) => string): Promise<{
+  port: number;
+  wsUrl: string;
+  requestCount: () => number;
+  close: () => Promise<void>;
+}> {
+  let wsUrl = "";
+  let requests = 0;
+  const server: Server = createServer((req, res) => {
+    if (req.url === "/json/version") {
+      requests += 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ webSocketDebuggerUrl: wsUrl }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  wsUrl = wsPathForPort(port);
+
+  return {
+    port,
+    wsUrl,
+    requestCount: () => requests,
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
 }
 
-async function writeDevToolsActivePort(
-  userDataDir: string,
-  port: number,
-  wsPath: string,
-): Promise<void> {
-  await fs.mkdir(userDataDir, { recursive: true });
-  await fs.writeFile(
-    path.join(userDataDir, "DevToolsActivePort"),
-    `${port}\n${wsPath}\n`,
-  );
+async function writeDevToolsActivePort(dir: string, port: number, wsPath: string): Promise<void> {
+  await writeFile(join(dir, "DevToolsActivePort"), `${port}\n${wsPath}\n`, "utf8");
 }
 
-async function listenNetServer(
-  server: net.Server,
-): Promise<{ port: number; close: () => Promise<void> }> {
-  await new Promise<void>((resolve) =>
-    server.listen(0, "127.0.0.1", () => resolve()),
-  );
-  const port = (server.address() as net.AddressInfo).port;
-  const close = () =>
-    new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve())),
-    );
-  closeCallbacks.push(close);
-  return { port, close };
-}
+describe("local CDP discovery", () => {
+  const tempDirs: string[] = [];
+  const servers: Array<() => Promise<void>> = [];
 
-async function listenHttpServer(
-  server: http.Server,
-): Promise<{ port: number; close: () => Promise<void> }> {
-  await new Promise<void>((resolve) =>
-    server.listen(0, "127.0.0.1", () => resolve()),
-  );
-  const port = (server.address() as net.AddressInfo).port;
-  const close = () =>
-    new Promise<void>((resolve, reject) =>
-      server.close((error) => (error ? reject(error) : resolve())),
-    );
-  closeCallbacks.push(close);
-  return { port, close };
-}
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map((close) => close()));
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
 
-afterEach(async () => {
-  while (closeCallbacks.length > 0) {
-    const close = closeCallbacks.pop();
-    if (!close) continue;
-    await close();
-  }
+  it("resolveWsTargetFromPort ignores a stale DevToolsActivePort file when the live browser reports a different target", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "browse-cdp-stale-"));
+    tempDirs.push(userDataDir);
 
-  while (cleanupPaths.length > 0) {
-    const target = cleanupPaths.pop();
-    if (!target) continue;
-    await fs.rm(target, { recursive: true, force: true });
-  }
-});
-
-describe("discoverLocalCdp", () => {
-  it("uses the exact DevToolsActivePort wsPath without extra HTTP or websocket preflights", async () => {
-    const root = await trackTempDir("stagehand-cli-discovery-");
-    const userDataDir = path.join(root, "Google Chrome");
-    const connectionPayloads: string[] = [];
-
-    const server = net.createServer((socket) => {
-      let payload = "";
-      socket.on("data", (chunk) => {
-        payload += chunk.toString();
-      });
-      socket.on("close", () => {
-        connectionPayloads.push(payload);
-      });
-    });
-
-    const { port } = await listenNetServer(server);
-    await writeDevToolsActivePort(
-      userDataDir,
+    const {
       port,
-      "/devtools/browser/actual",
-    );
+      wsUrl: liveWsUrl,
+      close,
+    } = await startFakeCdpServer((p) => `ws://127.0.0.1:${p}/devtools/browser/live-id`);
+    servers.push(close);
 
-    const result = await discoverLocalCdp({
+    await writeDevToolsActivePort(userDataDir, port, "/devtools/browser/stale-id");
+
+    const resolved = await resolveWsTargetFromPort(port, {
       userDataDirs: [userDataDir],
-      fallbackPorts: [],
     });
 
-    expect(result).toEqual({
-      wsUrl: `ws://127.0.0.1:${port}/devtools/browser/actual`,
-      source: "DevToolsActivePort (Google Chrome)",
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(connectionPayloads).toEqual([""]);
+    expect(resolved).toBe(liveWsUrl);
+    expect(resolved).not.toContain("stale-id");
   });
 
-  it("cleans up stale DevToolsActivePort files when the port is dead", async () => {
-    const root = await trackTempDir("stagehand-cli-stale-");
-    const userDataDir = path.join(root, "Google Chrome");
+  it("resolveWsTargetFromPort trusts a DevToolsActivePort file that matches the live browser", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "browse-cdp-fresh-"));
+    tempDirs.push(userDataDir);
 
-    const deadListener = net.createServer();
-    await new Promise<void>((resolve) =>
-      deadListener.listen(0, "127.0.0.1", () => resolve()),
-    );
-    const port = (deadListener.address() as net.AddressInfo).port;
-    await new Promise<void>((resolve) => deadListener.close(() => resolve()));
-    await writeDevToolsActivePort(userDataDir, port, "/devtools/browser/stale");
+    const {
+      port,
+      wsUrl: liveWsUrl,
+      close,
+    } = await startFakeCdpServer((p) => `ws://127.0.0.1:${p}/devtools/browser/current-id`);
+    servers.push(close);
 
-    const result = await discoverLocalCdp({
+    await writeDevToolsActivePort(userDataDir, port, "/devtools/browser/current-id");
+
+    const resolved = await resolveWsTargetFromPort(port, {
       userDataDirs: [userDataDir],
-      fallbackPorts: [],
     });
 
-    expect(result).toBeNull();
-    await expect(
-      fs.access(path.join(userDataDir, "DevToolsActivePort")),
-    ).rejects.toThrow();
+    expect(resolved).toBe(liveWsUrl);
   });
 
-  it("falls back to probing configured ports when no DevToolsActivePort files are found", async () => {
-    const server = http.createServer((req, res) => {
-      if (req.url !== "/json/version") {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
+  it("discoverLocalCdp skips a stale DevToolsActivePort candidate and falls back to a live fallback-port probe", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "browse-cdp-discover-"));
+    tempDirs.push(userDataDir);
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          webSocketDebuggerUrl:
-            "ws://127.0.0.1:65535/devtools/browser/fallback",
-        }),
-      );
-    });
+    const {
+      port,
+      wsUrl: liveWsUrl,
+      close,
+    } = await startFakeCdpServer((p) => `ws://127.0.0.1:${p}/devtools/browser/live-id`);
+    servers.push(close);
 
-    const { port } = await listenHttpServer(server);
+    await writeDevToolsActivePort(userDataDir, port, "/devtools/browser/stale-id");
 
-    const result = await discoverLocalCdp({
-      userDataDirs: [],
+    const discovered = await discoverLocalCdp({
+      userDataDirs: [userDataDir],
       fallbackPorts: [port],
     });
 
-    expect(result).toEqual({
-      wsUrl: "ws://127.0.0.1:65535/devtools/browser/fallback",
-      source: `port ${port}`,
-    });
+    expect(discovered?.wsUrl).toBe(liveWsUrl);
+    expect(discovered?.source).toBe(`port:${port}`);
   });
 
-  it("returns null when more than one live DevToolsActivePort candidate is found", async () => {
-    const root = await trackTempDir("stagehand-cli-ambiguous-");
-    const firstDir = path.join(root, "Google Chrome");
-    const secondDir = path.join(root, "Chromium");
+  it('resolveWsTargetFromPort trusts a live browser that reports "localhost" instead of "127.0.0.1"', async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "browse-cdp-host-"));
+    tempDirs.push(userDataDir);
 
-    const firstServer = net.createServer();
-    const secondServer = net.createServer();
-    const [{ port: firstPort }, { port: secondPort }] = await Promise.all([
-      listenNetServer(firstServer),
-      listenNetServer(secondServer),
-    ]);
-
-    await writeDevToolsActivePort(firstDir, firstPort, "/devtools/browser/one");
-    await writeDevToolsActivePort(
-      secondDir,
-      secondPort,
-      "/devtools/browser/two",
+    // Chrome's /json/version response can echo back whichever host the
+    // request used (or a fixed default), so a live browser can legitimately
+    // report "localhost" even though we always probe via 127.0.0.1.
+    const { port, close } = await startFakeCdpServer(
+      (p) => `ws://localhost:${p}/devtools/browser/current-id`,
     );
+    servers.push(close);
 
-    const result = await discoverLocalCdp({
-      userDataDirs: [firstDir, secondDir],
+    await writeDevToolsActivePort(userDataDir, port, "/devtools/browser/current-id");
+
+    const resolved = await resolveWsTargetFromPort(port, {
+      userDataDirs: [userDataDir],
+    });
+
+    expect(resolved).toBe(`ws://127.0.0.1:${port}/devtools/browser/current-id`);
+  });
+
+  it("discoverLocalCdp probes a port shared by a cached candidate and a fallback port only once", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "browse-cdp-memo-"));
+    tempDirs.push(userDataDir);
+
+    const {
+      port,
+      wsUrl: liveWsUrl,
+      close,
+      requestCount,
+    } = await startFakeCdpServer((p) => `ws://127.0.0.1:${p}/devtools/browser/live-id`);
+    servers.push(close);
+
+    await writeDevToolsActivePort(userDataDir, port, "/devtools/browser/stale-id");
+
+    const discovered = await discoverLocalCdp({
+      userDataDirs: [userDataDir],
+      fallbackPorts: [port],
+    });
+
+    expect(discovered?.wsUrl).toBe(liveWsUrl);
+    expect(requestCount()).toBe(1);
+  });
+
+  it("discoverLocalCdp returns null when no candidate is live", async () => {
+    const userDataDir = await mkdtemp(join(tmpdir(), "browse-cdp-none-"));
+    tempDirs.push(userDataDir);
+
+    await writeDevToolsActivePort(userDataDir, 9, "/devtools/browser/dead");
+
+    const discovered = await discoverLocalCdp({
+      userDataDirs: [userDataDir],
       fallbackPorts: [],
     });
 
-    expect(result).toBeNull();
+    expect(discovered).toBeNull();
   });
 });

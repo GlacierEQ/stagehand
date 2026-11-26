@@ -1,38 +1,17 @@
-/**
- * Auto-discovery: scans task directories and builds an in-memory TaskRegistry.
- *
- * Convention:
- *   core/tasks/<category>/<taskName>.ts
- *   tasks/bench/<category>/<taskName>.ts
- *
- * Discovery checks for:
- *   1. Default export from defineTask() (new API)
- *   2. Named export matching the filename (legacy EvalFunction pattern)
- */
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type {
-  BenchTaskMeta,
-  DiscoveredTask,
-  TaskDefinition,
-  TaskRegistry,
-  Tier,
-} from "./types.js";
+import type { BenchTaskMeta, DiscoveredTask, TaskDefinition, TaskRegistry, Tier } from "./types.js";
+import { listBenchSuiteTaskNames } from "./benchSuites.js";
 
 const TIERS = ["core", "bench"] as const satisfies readonly Tier[];
 
-/**
- * Category tags applied to specific bench tasks during non-eager discovery
- * so filters like `evals run regression` work without importing every task
- * module. Sourced from the legacy cli.ts. Long-term these belong in each
- * task's `meta.tags` — that migration is a separate cleanup.
- */
 const EXTRA_CATEGORIES: Record<string, string[]> = {
   instructions: ["regression"],
   ionwave: ["regression"],
   wichita: ["regression"],
   extract_memorial_healthcare: ["regression"],
+  observe_main_frame_element_ids: ["regression"],
   observe_github: ["regression"],
   observe_vantechjournal: ["regression"],
   observe_iframes1: ["regression"],
@@ -54,15 +33,12 @@ const EXTRA_CATEGORIES: Record<string, string[]> = {
   extract_geniusee_2: ["targeted_extract"],
 };
 
-/**
- * Tasks whose primary category should be replaced entirely (not
- * augmented) during discovery. External agent benchmarks are grouped here.
- */
 const CATEGORY_OVERRIDES: Record<string, string[]> = {
-  "agent/gaia": ["external_agent_benchmarks"],
   "agent/webvoyager": ["external_agent_benchmarks"],
   "agent/onlineMind2Web": ["external_agent_benchmarks"],
   "agent/webtailbench": ["external_agent_benchmarks"],
+  "agent/hardbenchmark": ["external_agent_benchmarks"],
+  "agent/odysseysbench": ["external_agent_benchmarks"],
 };
 
 function getTaskBasename(taskName: string): string {
@@ -72,11 +48,7 @@ function getTaskBasename(taskName: string): string {
 }
 
 function getExtraCategories(taskName: string): string[] {
-  return (
-    EXTRA_CATEGORIES[taskName] ??
-    EXTRA_CATEGORIES[getTaskBasename(taskName)] ??
-    []
-  );
+  return EXTRA_CATEGORIES[taskName] ?? EXTRA_CATEGORIES[getTaskBasename(taskName)] ?? [];
 }
 
 type ParsedTaskPath = {
@@ -85,9 +57,6 @@ type ParsedTaskPath = {
   name: string;
 };
 
-/**
- * Recursively find all .ts files in a directory, ignoring .d.ts files.
- */
 function walkDir(dir: string): string[] {
   const results: string[] = [];
   if (!fs.existsSync(dir)) return results;
@@ -118,33 +87,18 @@ function getTierRoots(tasksRoot: string, tier: Tier): string[] {
   return [path.join(packageRoot, "core", "tasks")];
 }
 
-/**
- * Extract category and task name from a file path rooted at a tier directory.
- *
- * Given core/tasks/navigation/open.ts or tasks/bench/act/dropdown.ts:
- * Returns tier/category/name using the provided tier.
- */
-function parseTaskPath(
-  filePath: string,
-  tierRoot: string,
-  tier: Tier,
-): ParsedTaskPath | null {
+function parseTaskPath(filePath: string, tierRoot: string, tier: Tier): ParsedTaskPath | null {
   const relative = path.relative(tierRoot, filePath);
   const parts = relative.replace(/\\/g, "/").split("/");
 
-  // Minimum: <category>/<file>.ts
   if (parts.length < 2) return null;
 
   const category = parts[0];
   const fileName = parts[parts.length - 1].replace(/\.(ts|js)$/, "");
 
-  // For deeper nesting (e.g., bench/agent/subfolder/task.ts), include the
-  // intermediate path in the name for uniqueness.
   const nameParts = parts.slice(0, -1);
   const name =
-    nameParts.length > 1
-      ? `${nameParts.join("/")}/${fileName}`
-      : `${category}/${fileName}`;
+    nameParts.length > 1 ? `${nameParts.join("/")}/${fileName}` : `${category}/${fileName}`;
 
   const simpleName = category === fileName ? fileName : name;
 
@@ -155,11 +109,6 @@ function parseTaskPath(
   };
 }
 
-/**
- * Import a task module and extract the task definition.
- *
- * Handles both new defineTask() default exports and legacy named exports.
- */
 async function loadTaskModule(
   filePath: string,
   expectedName: string,
@@ -172,9 +121,7 @@ async function loadTaskModule(
     return { isLegacy: false, definition: defaultExport as TaskDefinition };
   }
 
-  const baseName = expectedName.includes("/")
-    ? expectedName.split("/").pop()
-    : expectedName;
+  const baseName = expectedName.includes("/") ? expectedName.split("/").pop() : expectedName;
 
   if (baseName && typeof taskModule[baseName] === "function") {
     return { isLegacy: true };
@@ -183,21 +130,33 @@ async function loadTaskModule(
   return { isLegacy: false };
 }
 
-/**
- * Discover all tasks by scanning the filesystem.
- *
- * @param tasksRoot - Absolute path to the tasks/ directory
- * @param eager - If true, imports modules to read defineTask metadata.
- *                If false (default), only uses filesystem-based inference.
- */
-export async function discoverTasks(
-  tasksRoot: string,
-  eager = false,
-): Promise<TaskRegistry> {
+const AGENT_SUITE_NAMES = listBenchSuiteTaskNames();
+
+export async function discoverTasks(tasksRoot: string, eager = false): Promise<TaskRegistry> {
   const tasks: DiscoveredTask[] = [];
   const byName = new Map<string, DiscoveredTask>();
   const byTier = new Map<Tier, DiscoveredTask[]>();
   const byCategory = new Map<string, DiscoveredTask[]>();
+
+  for (const name of AGENT_SUITE_NAMES) {
+    const task: DiscoveredTask = {
+      name,
+      tier: "bench",
+      primaryCategory: "external_agent_benchmarks",
+      categories: ["external_agent_benchmarks"],
+      tags: [],
+      filePath: "",
+      isLegacy: false,
+    };
+    tasks.push(task);
+    byName.set(task.name, task);
+    if (!byTier.has("bench")) byTier.set("bench", []);
+    byTier.get("bench")!.push(task);
+    if (!byCategory.has("external_agent_benchmarks")) {
+      byCategory.set("external_agent_benchmarks", []);
+    }
+    byCategory.get("external_agent_benchmarks")!.push(task);
+  }
 
   for (const tier of TIERS) {
     const tierRoots = getTierRoots(tasksRoot, tier);
@@ -242,10 +201,7 @@ export async function discoverTasks(
         const override = CATEGORY_OVERRIDES[taskName];
         const baseCategories = override
           ? [...override]
-          : [
-              parsed.category,
-              ...extraCategories.filter((c) => c !== parsed.category),
-            ];
+          : [parsed.category, ...extraCategories.filter((c) => c !== parsed.category)];
 
         const hardcodedExtras = getExtraCategories(taskName);
         const categories = [...baseCategories];
@@ -281,20 +237,7 @@ export async function discoverTasks(
   return { tasks, byName, byTier, byCategory };
 }
 
-/**
- * Resolve a CLI target string to a list of tasks.
- *
- * Target resolution order:
- *   1. Tier-qualified: "core:navigation" → tier=core, category=navigation
- *   2. Tier name: "core" → all tasks in that tier
- *   3. Category name: "act" → all tasks with that category (errors on ambiguity)
- *   4. Task name: "dropdown" → specific task by name
- *   5. No target: defaults to all bench tasks
- */
-export function resolveTarget(
-  registry: TaskRegistry,
-  target?: string,
-): DiscoveredTask[] {
+export function resolveTarget(registry: TaskRegistry, target?: string): DiscoveredTask[] {
   if (!target) {
     return registry.byTier.get("bench") ?? [];
   }
@@ -304,15 +247,11 @@ export function resolveTarget(
     const tier = tierPart as Tier;
 
     if (!TIERS.includes(tier)) {
-      throw new Error(
-        `Unknown tier "${tierPart}". Valid tiers: ${TIERS.join(", ")}`,
-      );
+      throw new Error(`Unknown tier "${tierPart}". Valid tiers: ${TIERS.join(", ")}`);
     }
 
     const tierTasks = registry.byTier.get(tier) ?? [];
-    const matches = tierTasks.filter((t) =>
-      t.categories.includes(categoryPart),
-    );
+    const matches = tierTasks.filter((t) => t.categories.includes(categoryPart));
     if (matches.length === 0) {
       throw new Error(
         `No tasks found matching "${target}". Run "evals list" to see available tasks.`,
@@ -330,9 +269,7 @@ export function resolveTarget(
     const tiers = new Set(categoryTasks.map((t) => t.tier));
     if (tiers.size > 1) {
       const tierList = [...tiers].map((t) => `${t}:${target}`).join(" or ");
-      throw new Error(
-        `"${target}" exists in both ${[...tiers].join(" and ")}. Use ${tierList}.`,
-      );
+      throw new Error(`"${target}" exists in both ${[...tiers].join(" and ")}. Use ${tierList}.`);
     }
     return categoryTasks;
   }
@@ -342,14 +279,10 @@ export function resolveTarget(
     return [task];
   }
 
-  const partial = registry.tasks.filter(
-    (t) => t.name.endsWith(`/${target}`) || t.name === target,
-  );
+  const partial = registry.tasks.filter((t) => t.name.endsWith(`/${target}`) || t.name === target);
   if (partial.length > 0) {
     return partial;
   }
 
-  throw new Error(
-    `No tasks found matching "${target}". Run "evals list" to see available tasks.`,
-  );
+  throw new Error(`No tasks found matching "${target}". Run "evals list" to see available tasks.`);
 }

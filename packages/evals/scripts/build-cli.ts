@@ -1,11 +1,3 @@
-/**
- * Build the evals CLI (packages/evals/dist/cli/cli.js + config), including a node shebang.
- *
- * Prereqs: pnpm install.
- * Args: none.
- * Env: none.
- * Example: pnpm run build:cli
- */
 import fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { getRepoRootDir } from "../runtimePaths.js";
@@ -35,37 +27,52 @@ run([
   "--log-level=warning",
 ]);
 
-/* ── merge config: always update tasks/benchmarks from source, but preserve user defaults ── */
+const PREVIOUS_TRACKED_DEFAULTS: Record<string, unknown> = {
+  env: "local",
+  trials: 3,
+  concurrency: 10,
+  model: null,
+  api: false,
+  verbose: false,
+};
 const sourceConfig = JSON.parse(
   fs.readFileSync(`${repoRoot}/packages/evals/evals.config.json`, "utf-8"),
 );
 const distConfigPath = `${repoRoot}/packages/evals/dist/cli/evals.config.json`;
+const distLocalConfigPath = `${repoRoot}/packages/evals/dist/cli/evals.config.local.json`;
 
-if (fs.existsSync(distConfigPath)) {
+if (fs.existsSync(distConfigPath) && !fs.existsSync(distLocalConfigPath)) {
   try {
-    const existing = JSON.parse(fs.readFileSync(distConfigPath, "utf-8"));
-    if (existing.defaults) {
-      sourceConfig.defaults = {
-        ...sourceConfig.defaults,
-        ...existing.defaults,
-      };
+    const existing = JSON.parse(fs.readFileSync(distConfigPath, "utf-8")) as Record<
+      string,
+      Record<string, unknown> | undefined
+    >;
+    const local: Record<string, Record<string, unknown>> = {};
+    for (const section of ["defaults", "core", "tracing", "_meta"]) {
+      const before = existing[section];
+      if (!before || typeof before !== "object") continue;
+      const source = (sourceConfig[section] ?? {}) as Record<string, unknown>;
+      const diff: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(before)) {
+        if (section === "defaults" && key === "provider") continue;
+        if (JSON.stringify(source[key]) === JSON.stringify(value)) continue;
+        if (
+          section === "defaults" &&
+          key in PREVIOUS_TRACKED_DEFAULTS &&
+          JSON.stringify(PREVIOUS_TRACKED_DEFAULTS[key]) === JSON.stringify(value)
+        ) {
+          continue;
+        }
+        diff[key] = value;
+      }
+      if (Object.keys(diff).length > 0) local[section] = diff;
     }
-    // Preserve the first-run welcome marker across rebuilds so a contributor
-    // who's already seen the welcome on the dist path doesn't see it again
-    // after every `pnpm run build:cli`. If the source has _meta and dist
-    // doesn't (fresh dist install), the source value is inherited via the
-    // sourceConfig literal — already correct.
-    if (existing._meta) {
-      sourceConfig._meta = { ...sourceConfig._meta, ...existing._meta };
+    if (Object.keys(local).length > 0) {
+      fs.writeFileSync(distLocalConfigPath, JSON.stringify(local, null, 2) + "\n");
     }
-  } catch {
-    // invalid existing config – overwrite entirely
-  }
+  } catch {}
 }
 
 fs.writeFileSync(distConfigPath, JSON.stringify(sourceConfig, null, 2) + "\n");
-fs.writeFileSync(
-  `${repoRoot}/packages/evals/dist/cli/package.json`,
-  '{\n  "type": "module"\n}\n',
-);
+fs.writeFileSync(`${repoRoot}/packages/evals/dist/cli/package.json`, '{\n  "type": "module"\n}\n');
 fs.chmodSync(`${repoRoot}/packages/evals/dist/cli/cli.js`, 0o755);

@@ -1,24 +1,7 @@
-/**
- * Shared argument parsing + option resolution for the evals CLI.
- *
- * Both the argv dispatch in cli.ts and the REPL tokenizer in repl.ts feed
- * tokens through parseRunArgs() here, and both resolve their final option
- * bundle through resolveRunOptions() — so flag semantics stay identical
- * regardless of entry point.
- *
- * Precedence (enforced by resolveRunOptions):
- *   1. CLI flags (highest)
- *   2. Benchmark shorthand derived overrides (b:/benchmark:<name>)
- *   3. STAGEHAND_BROWSER_TARGET (env-only fallback for --env)
- *   4. Config defaults (evals.config.json)
- *   5. Ambient EVAL_* env vars consumed downstream by runner/suites
- */
-import {
-  DEFAULT_BENCH_HARNESS,
-  parseBenchHarness,
-  type Harness,
-} from "../../framework/benchTypes.js";
-import type { AgentToolMode } from "@browserbasehq/stagehand";
+import { DEFAULT_BENCH_HARNESS, type Harness } from "../../framework/benchTypes.js";
+import { TRACING_ENV_VARS } from "./config.js";
+import { getBenchHarness, parseBenchHarness } from "../../framework/benchHarness.js";
+import { isBenchSuite, listBenchSuites } from "../../framework/benchSuites.js";
 
 export interface RunFlags {
   target?: string;
@@ -26,32 +9,48 @@ export interface RunFlags {
   concurrency?: number;
   env?: string;
   model?: string;
-  provider?: string;
   api?: boolean;
   tool?: string;
   startup?: string;
   harness?: string;
-  agentMode?: string;
-  agentModes?: AgentToolMode[];
   limit?: number;
   sample?: number;
   filter?: Array<[string, string]>;
   dryRun?: boolean;
   preview?: boolean;
-  /** Spawn the pre-refactor index.eval.ts runner instead of the unified path. */
-  legacy?: boolean;
+  json?: boolean;
+  verbose?: boolean;
+  follow?: string;
+  success?: SuccessMode;
 }
+
+export type SuccessMode = "outcome" | "process" | "both";
+const SUCCESS_MODES: ReadonlySet<SuccessMode> = new Set<SuccessMode>([
+  "outcome",
+  "process",
+  "both",
+]);
 
 export interface ConfigDefaults {
   env?: string;
   trials?: number;
   concurrency?: number;
-  provider?: string | null;
   model?: string | null;
   api?: boolean;
   verbose?: boolean | null;
-  agentModes?: AgentToolMode[] | null;
+  harness?: string | null;
+  successMode?: string | null;
 }
+
+export interface RunConfigSections {
+  benchmarks?: Record<string, { limit?: number | null }>;
+  harnesses?: Record<string, { models?: string[] | null; tool?: string | null }>;
+  providers?: Record<string, { concurrency?: number | null }>;
+  verifier?: { model?: string | null; maxUnverifiableCriteria?: number | null };
+  campaign?: { tag?: string | null };
+}
+
+export const CAMPAIGN_TAG_ENV = "EVAL_CAMPAIGN_TAG";
 
 export interface ResolvedRunOptions {
   target?: string;
@@ -60,33 +59,22 @@ export interface ResolvedRunOptions {
   concurrency: number;
   environment: "LOCAL" | "BROWSERBASE";
   model?: string;
-  provider?: string;
   useApi: boolean;
   coreToolSurface?: string;
   coreStartupProfile?: string;
   harness: Harness;
-  agentMode?: AgentToolMode;
-  agentModes?: AgentToolMode[];
   datasetFilter?: string;
+  successMode: SuccessMode;
   envOverrides: Record<string, string>;
   dryRun: boolean;
   preview: boolean;
+  json?: boolean;
+  providerConcurrency?: Record<string, number>;
   verbose: boolean;
+  follow?: string;
 }
 
-/**
- * Suites wired into the unified runner. GAIA remains legacy-only;
- * WebBench never had a unified suite implementation.
- */
-const SUPPORTED_BENCHMARKS = new Set([
-  "webvoyager",
-  "onlineMind2Web",
-  "webtailbench",
-]);
-
-const LEGACY_ONLY_BENCHMARKS = new Set(["gaia", "osworld"]);
-
-const BOOLEAN_FLAGS = new Set(["api", "dry-run", "preview", "legacy"]);
+const BOOLEAN_FLAGS = new Set(["api", "dry-run", "preview", "json", "verbose"]);
 const VALUE_FLAGS = new Set([
   "trials",
   "concurrency",
@@ -94,21 +82,20 @@ const VALUE_FLAGS = new Set([
   "sample",
   "env",
   "model",
-  "provider",
   "tool",
   "startup",
   "harness",
-  "agent-mode",
-  "agent-modes",
   "filter",
+  "success",
+  "follow",
 ]);
 
 const FLAG_ALIASES: Record<string, string> = {
+  v: "verbose",
   t: "trials",
   c: "concurrency",
   e: "env",
   m: "model",
-  p: "provider",
   l: "limit",
   s: "sample",
   f: "filter",
@@ -126,36 +113,12 @@ function parsePositiveInteger(raw: string, optionName: string): number {
   return parsed;
 }
 
-function normalizeEnvironment(
-  raw: string,
-  source: string,
-): "local" | "browserbase" {
+function normalizeEnvironment(raw: string, source: string): "local" | "browserbase" {
   const normalized = raw.toLowerCase();
   if (normalized !== "local" && normalized !== "browserbase") {
     throw new Error(`${source} must be "local" or "browserbase"`);
   }
   return normalized;
-}
-
-function normalizeAgentMode(raw: string): AgentToolMode {
-  if (raw !== "dom" && raw !== "hybrid" && raw !== "cua") {
-    throw new Error('--agent-mode must be "dom", "hybrid", or "cua"');
-  }
-  return raw;
-}
-
-export function parseAgentModes(raw: string): AgentToolMode[] {
-  const modes = raw
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map(normalizeAgentMode);
-
-  if (modes.length === 0) {
-    throw new Error("--agent-modes must include at least one mode");
-  }
-
-  return [...new Set(modes)];
 }
 
 function parseFilter(raw: string): [string, string] {
@@ -175,10 +138,7 @@ function parseFilter(raw: string): [string, string] {
   return [key, value];
 }
 
-function readPositiveInteger(
-  value: number | undefined | null,
-  source: string,
-): number | undefined {
+function readPositiveInteger(value: number | undefined | null, source: string): number | undefined {
   if (value === undefined || value === null) return undefined;
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${source} must be a positive integer`);
@@ -186,10 +146,6 @@ function readPositiveInteger(
   return value;
 }
 
-/**
- * Parse an argv or REPL-token stream into a RunFlags structure. The first
- * non-flag token becomes `target`; later positional args are rejected.
- */
 export function parseRunArgs(tokens: string[]): RunFlags {
   const flags: RunFlags = {};
   const filters: Array<[string, string]> = [];
@@ -206,7 +162,8 @@ export function parseRunArgs(tokens: string[]): RunFlags {
         if (name === "api") flags.api = true;
         else if (name === "dry-run") flags.dryRun = true;
         else if (name === "preview") flags.preview = true;
-        else if (name === "legacy") flags.legacy = true;
+        else if (name === "json") flags.json = true;
+        else if (name === "verbose") flags.verbose = true;
         i++;
         continue;
       }
@@ -239,9 +196,6 @@ export function parseRunArgs(tokens: string[]): RunFlags {
         case "model":
           flags.model = value;
           break;
-        case "provider":
-          flags.provider = value;
-          break;
         case "tool":
           flags.tool = value;
           break;
@@ -251,14 +205,19 @@ export function parseRunArgs(tokens: string[]): RunFlags {
         case "harness":
           flags.harness = value;
           break;
-        case "agent-mode":
-          flags.agentMode = normalizeAgentMode(value);
-          break;
-        case "agent-modes":
-          flags.agentModes = parseAgentModes(value);
+        case "follow":
+          flags.follow = value;
           break;
         case "filter": {
           filters.push(parseFilter(value));
+          break;
+        }
+        case "success": {
+          const v = value.toLowerCase() as SuccessMode;
+          if (!SUCCESS_MODES.has(v)) {
+            throw new Error(`--success must be one of: outcome, process, both (got "${value}")`);
+          }
+          flags.success = v;
           break;
         }
         default:
@@ -287,18 +246,11 @@ export function parseRunArgs(tokens: string[]): RunFlags {
   return flags;
 }
 
-/**
- * Normalize a run target. Returns the target to hand to resolveTarget()
- * along with any env var overrides + datasetFilter needed for the
- * downstream runner / suites.
- *
- *   "all" → undefined (resolveTarget treats undefined as all bench tasks)
- *   "b:webvoyager" / "benchmark:webvoyager" → "agent/webvoyager" + EVAL_DATASET + EVAL_WEBVOYAGER_*
- *   other → passed through unchanged
- */
 export function applyBenchmarkShorthand(
   target: string | undefined,
   flags: RunFlags,
+  benchmarks: RunConfigSections["benchmarks"] = {},
+  env: NodeJS.ProcessEnv = process.env,
 ): {
   target: string | undefined;
   datasetFilter?: string;
@@ -317,28 +269,26 @@ export function applyBenchmarkShorthand(
 
   const benchmarkName = match[2];
 
-  if (LEGACY_ONLY_BENCHMARKS.has(benchmarkName)) {
-    if (!flags.legacy) {
-      throw new Error(
-        `Benchmark "${benchmarkName}" is legacy-only. Use --legacy or choose one of: ${[...SUPPORTED_BENCHMARKS].join(", ")}.`,
-      );
-    }
-  }
-
-  if (
-    !SUPPORTED_BENCHMARKS.has(benchmarkName) &&
-    !LEGACY_ONLY_BENCHMARKS.has(benchmarkName)
-  ) {
+  if (!isBenchSuite(benchmarkName)) {
     throw new Error(
-      `Unknown benchmark "${benchmarkName}". Supported: ${[...SUPPORTED_BENCHMARKS].join(", ")}.`,
+      `Unknown benchmark "${benchmarkName}". Supported: ${listBenchSuites().join(", ")}.`,
     );
   }
 
   const upper = benchmarkName.toUpperCase();
   envOverrides.EVAL_DATASET = benchmarkName;
+  const limitEnv = `EVAL_${upper}_LIMIT`;
+  const configLimit = benchmarks[benchmarkName]?.limit;
   if (flags.limit !== undefined) {
     envOverrides.EVAL_MAX_K = String(flags.limit);
-    envOverrides[`EVAL_${upper}_LIMIT`] = String(flags.limit);
+    envOverrides[limitEnv] = String(flags.limit);
+  } else if (
+    typeof configLimit === "number" &&
+    configLimit > 0 &&
+    !env[limitEnv]?.trim() &&
+    !env.EVAL_MAX_K?.trim()
+  ) {
+    envOverrides[limitEnv] = String(configLimit);
   }
   if (flags.sample !== undefined) {
     envOverrides[`EVAL_${upper}_SAMPLE`] = String(flags.sample);
@@ -354,14 +304,15 @@ export function applyBenchmarkShorthand(
   };
 }
 
-/**
- * Resolve RunFlags + config defaults + process.env into the final
- * ResolvedRunOptions bundle passed to runCommand. Applies precedence in a
- * single place so the order is greppable and testable.
- */
 export interface CoreConfig {
   tool?: string;
   startup?: string;
+}
+
+export interface TracingConfig {
+  transport?: string;
+  braintrustProject?: string;
+  langsmithProject?: string;
 }
 
 export function resolveRunOptions(
@@ -369,6 +320,8 @@ export function resolveRunOptions(
   defaults: ConfigDefaults,
   env: NodeJS.ProcessEnv,
   core: CoreConfig = {},
+  tracing: TracingConfig = {},
+  sections: RunConfigSections = {},
 ): ResolvedRunOptions {
   const parseIntEnv = (value: string | undefined): number | undefined => {
     if (!value) return undefined;
@@ -376,11 +329,7 @@ export function resolveRunOptions(
   };
 
   const rawEnv =
-    flags.env ??
-    env.STAGEHAND_BROWSER_TARGET ??
-    defaults.env ??
-    env.EVAL_ENV ??
-    "local";
+    flags.env ?? env.STAGEHAND_BROWSER_TARGET ?? defaults.env ?? env.EVAL_ENV ?? "local";
   const envLower = normalizeEnvironment(rawEnv, "Environment");
   const environment = envLower === "browserbase" ? "BROWSERBASE" : "LOCAL";
 
@@ -388,14 +337,10 @@ export function resolveRunOptions(
     target,
     datasetFilter: shorthandDatasetFilter,
     envOverrides,
-  } = applyBenchmarkShorthand(flags.target, flags);
+  } = applyBenchmarkShorthand(flags.target, flags, sections.benchmarks, env);
 
-  const model =
-    flags.model ?? defaults.model ?? env.EVAL_MODEL_OVERRIDE ?? undefined;
-  const provider =
-    flags.provider ?? defaults.provider ?? env.EVAL_PROVIDER ?? undefined;
-  const useApi =
-    flags.api ?? defaults.api ?? (env.USE_API ?? "").toLowerCase() === "true";
+  const model = flags.model ?? defaults.model ?? env.EVAL_MODEL_OVERRIDE ?? undefined;
+  const useApi = flags.api ?? defaults.api ?? (env.USE_API ?? "").toLowerCase() === "true";
   const trials =
     flags.trials ??
     readPositiveInteger(defaults.trials, "defaults.trials") ??
@@ -408,24 +353,72 @@ export function resolveRunOptions(
     3;
 
   const datasetFilter = shorthandDatasetFilter ?? env.EVAL_DATASET ?? undefined;
-  const harness = parseBenchHarness(flags.harness ?? DEFAULT_BENCH_HARNESS);
-  const agentMode = flags.agentMode
-    ? normalizeAgentMode(flags.agentMode)
-    : undefined;
-  const agentModes = agentMode
-    ? undefined
-    : (flags.agentModes ?? defaults.agentModes ?? undefined);
+  const harness = parseBenchHarness(
+    flags.harness ?? defaults.harness?.trim() ?? DEFAULT_BENCH_HARNESS,
+  );
+  const harnessConfig = sections.harnesses?.[harness];
+
+  const harnessModels = harnessConfig?.models?.map((model) => model.trim()).filter(Boolean);
+  const modelsEnv = `EVAL_${harness.toUpperCase()}_MODELS`;
+  if (
+    getBenchHarness(harness).defaultModels &&
+    harnessModels &&
+    harnessModels.length > 0 &&
+    !env[modelsEnv]?.trim()
+  ) {
+    envOverrides[modelsEnv] = harnessModels.join(",");
+  }
+
+  const verifierModel = sections.verifier?.model?.trim();
+  if (verifierModel && !env.EVAL_VERIFIER_MODEL?.trim()) {
+    envOverrides.EVAL_VERIFIER_MODEL = verifierModel;
+  }
+  const maxUnverifiable = sections.verifier?.maxUnverifiableCriteria;
+  if (
+    typeof maxUnverifiable === "number" &&
+    maxUnverifiable >= 0 &&
+    !env.EVAL_MAX_UNVERIFIABLE_CRITERIA?.trim()
+  ) {
+    envOverrides.EVAL_MAX_UNVERIFIABLE_CRITERIA = String(maxUnverifiable);
+  }
+  const campaignTag = sections.campaign?.tag?.trim();
+  if (campaignTag && !env[CAMPAIGN_TAG_ENV]?.trim()) {
+    envOverrides[CAMPAIGN_TAG_ENV] = campaignTag;
+  }
+
+  const providerConcurrency = Object.fromEntries(
+    Object.entries(sections.providers ?? {}).flatMap(([provider, section]) => {
+      const width = section?.concurrency;
+      return typeof width === "number" && Number.isInteger(width) && width > 0
+        ? [[provider.toLowerCase(), width]]
+        : [];
+    }),
+  );
+
+  for (const key of Object.keys(TRACING_ENV_VARS) as Array<keyof TracingConfig>) {
+    const value = tracing[key]?.trim();
+    const envName = TRACING_ENV_VARS[key];
+    if (value && !env[envName]?.trim()) envOverrides[envName] = value;
+  }
 
   envOverrides.EVAL_ENV = environment;
   envOverrides.USE_API = String(Boolean(useApi));
   envOverrides.EVAL_TRIAL_COUNT = String(trials);
   envOverrides.EVAL_MAX_CONCURRENCY = String(concurrency);
-  if (provider !== undefined) {
-    envOverrides.EVAL_PROVIDER = provider;
-  }
   if (model !== undefined) {
     envOverrides.EVAL_MODEL_OVERRIDE = model;
   }
+
+  const envSuccess = (env.EVAL_SUCCESS_MODE ?? "").toLowerCase();
+  const configSuccess = (defaults.successMode ?? "").toLowerCase();
+  const successMode: SuccessMode =
+    flags.success ??
+    (SUCCESS_MODES.has(envSuccess as SuccessMode)
+      ? (envSuccess as SuccessMode)
+      : SUCCESS_MODES.has(configSuccess as SuccessMode)
+        ? (configSuccess as SuccessMode)
+        : "outcome");
+  envOverrides.EVAL_SUCCESS_MODE = successMode;
 
   return {
     target: flags.target,
@@ -434,36 +427,37 @@ export function resolveRunOptions(
     concurrency,
     environment,
     model: model ?? undefined,
-    provider: provider ?? undefined,
     useApi: Boolean(useApi),
-    coreToolSurface: flags.tool ?? core.tool,
+    coreToolSurface: flags.tool ?? harnessConfig?.tool?.trim() ?? core.tool,
     coreStartupProfile: flags.startup ?? core.startup,
     harness,
-    agentMode,
-    agentModes,
     datasetFilter,
+    successMode,
     envOverrides,
     dryRun: flags.dryRun ?? false,
     preview: flags.preview ?? false,
-    verbose: defaults.verbose ?? false,
+    json: flags.json ?? false,
+    ...(Object.keys(providerConcurrency).length > 0 && { providerConcurrency }),
+    verbose: flags.verbose ?? defaults.verbose ?? false,
+    ...(flags.follow && { follow: flags.follow }),
   };
 }
 
-/**
- * Set env overrides for the duration of `fn` and restore prior values in
- * a `finally` block. Needed because the REPL is a long-lived process and
- * suites/*.ts read env vars directly — unscoped mutations would leak
- * between REPL commands.
- */
+const RUN_STAMPED_ENV_KEYS = [
+  "EVAL_TRAJECTORY_GROUP",
+  "EVAL_EXPERIMENT_NAME",
+  "EVAL_TRAJECTORY_MODEL",
+];
+
 export async function withEnvOverrides<T>(
   overrides: Record<string, string>,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const keys = Object.keys(overrides);
+  const keys = [...new Set([...Object.keys(overrides), ...RUN_STAMPED_ENV_KEYS])];
   const previous: Record<string, string | undefined> = {};
   for (const key of keys) {
     previous[key] = process.env[key];
-    process.env[key] = overrides[key];
+    if (key in overrides) process.env[key] = overrides[key];
   }
   try {
     return await fn();

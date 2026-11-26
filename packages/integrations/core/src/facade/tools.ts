@@ -1,0 +1,699 @@
+import { randomBytes } from "node:crypto";
+import fsp from "node:fs/promises";
+import { constants } from "node:fs";
+import path from "node:path";
+import type { ExperimentalBatchCallback, Page, Stagehand } from "@browserbasehq/stagehand";
+import { sanitizeErrorMessage } from "../harness/redact.js";
+import {
+  browserSessionLostError,
+  DEFAULT_ARTIFACT_DIRECTORY,
+  FACADE_BROWSER_CLOSED_ERROR,
+  NAVIGATED_SNAPSHOT_ERROR,
+  NO_HYDRATED_SNAPSHOT_ERROR,
+  RefActionSchema,
+  RUN_OPTIONS,
+  RUN_RESULT_LIMITS,
+  RUN_RESULT_MALFORMED_ERROR,
+  RUN_VALUE_SIZE_ERROR,
+  SCREENSHOT_ARTIFACT_CONTENT_ERROR,
+  SCREENSHOT_ARTIFACT_COUNT_ERROR,
+  SCREENSHOT_ARTIFACT_FILE_SYMLINK_ERROR,
+  SCREENSHOT_ARTIFACT_NOT_DIRECTORY_ERROR,
+  SCREENSHOT_ARTIFACT_NOT_FILE_ERROR,
+  SCREENSHOT_ARTIFACT_PATH_ERROR,
+  SCREENSHOT_ARTIFACT_SIZE_ERROR,
+  SCREENSHOT_ARTIFACT_SYMLINK_ERROR,
+  SCREENSHOT_ARTIFACT_TOTAL_SIZE_ERROR,
+  SCREENSHOT_ARTIFACT_TYPE_ERROR,
+  screenshotArtifactWriteError,
+  staleSnapshotIdError,
+  type FacadeSessionLoss,
+  type RefAction,
+  UNMANAGED_ACTIVE_PAGE_ERROR_MARKER,
+} from "./contract.js";
+import {
+  actionRunner,
+  runCallback,
+  type RunEnvelope,
+  type RunInput,
+  type ScreenshotArtifact,
+} from "./batch-sources.js";
+import type { PlaywrightCompatTelemetry } from "./runtime.js";
+
+type SnapshotState = { url: string; xpathById: Record<string, string> };
+
+export type StagehandFacadeRunReport = {
+  telemetry: PlaywrightCompatTelemetry;
+  quietWait: boolean;
+  /** Wall-clock time of the whole experimentalBatch round trip. */
+  batchRoundTripMs: number;
+  /** Time the agent's code spent executing inside the batch. */
+  batchRuntimeMs: number;
+  closeRequested: boolean;
+};
+
+export class StagehandFacadeCleanupError extends Error {
+  override readonly name = "StagehandFacadeCleanupError";
+
+  constructor() {
+    super("Failed to close the Stagehand browser session.");
+  }
+}
+
+export class StagehandFacadeInputError extends Error {
+  override readonly name = "StagehandFacadeInputError";
+
+  constructor(message: string) {
+    super(sanitizeErrorMessage(message));
+  }
+}
+
+export class StagehandFacadeExecutionError extends Error {
+  readonly facadeExecutionError = true;
+
+  constructor(error: { name: string; message: string }) {
+    super(sanitizeErrorMessage(error.message));
+    const name = sanitizeErrorMessage(error.name);
+    this.name = /^[A-Za-z][A-Za-z0-9]*Error$/u.test(name) ? name : "Error";
+    this.stack = undefined;
+  }
+}
+
+export type StagehandFacadeToolsOptions = {
+  /** Replaces default cleanup when the host owns session release and replacement. */
+  onCloseRequested?: () => Promise<void>;
+  /**
+   * Dedicated directory for screenshot artifacts. Paths must stay within it and
+   * name a .png/.jpg/.jpeg file holding PNG or JPEG bytes, checked for every
+   * artifact before any is written; run code can replace any such image under it. Defaults to DEFAULT_ARTIFACT_DIRECTORY under
+   * process.cwd(), which must not be a symlink; a configured root may be one.
+   * New files are owner-only; a replaced file keeps its permissions.
+   */
+  artifactRoot?: string;
+  /** Observes every completed `run` batch (including ones whose code threw). */
+  onRunReport?: (report: StagehandFacadeRunReport) => void;
+  /** Fires once, the first time a call proves the browser session is gone. */
+  onSessionLost?: (loss: FacadeSessionLoss) => void;
+  /**
+   * Keep a hidden about:blank tab open for the whole session (default true).
+   * Chrome exits when its last tab closes, so a renderer crash on the agent's
+   * only tab ("Render process gone" on heavy retail pages) used to end the
+   * Browserbase session and turn one bad page into a terminal
+   * "Browser session lost". With the keeper, the browser survives and the next
+   * call gets a fresh page instead. The keeper is invisible to agent code
+   * (`context.pages()` / `waitForEvent("page")` never list it).
+   */
+  keeperPage?: boolean;
+  /**
+   * Experimental, off by default: page.waitForTimeout(ms) longer than 400 ms
+   * in run code returns once the main document is quiet, capped at ms (see
+   * RUN_OPTIONS.quietWait). The run
+   * report's telemetry.waits shows requested against waited time.
+   */
+  quietWait?: boolean;
+};
+
+/** Every facade tool returns this once the browser session is gone. */
+export class StagehandFacadeSessionLostError extends Error {
+  override readonly name = "StagehandFacadeSessionLostError";
+  constructor(readonly loss: FacadeSessionLoss) {
+    super(browserSessionLostError(loss.cause));
+  }
+}
+
+const RUN_BATCH_TIMEOUT_MS = 60_000;
+const PAGE_CAPTURE_DEADLINE_MS = 120_000;
+
+export type StagehandFacadeScreenshot = {
+  data: string;
+  mimeType: "image/png" | "image/jpeg";
+};
+
+const ARTIFACT_EXTENSION = /\.(?:png|jpe?g)$/iu;
+/** NAME_MAX on Linux and macOS, in bytes. */
+const MAX_NAME_BYTES = 255;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
+
+/** Either signature is accepted under any image extension, as Playwright's `type` wins over the path. */
+function isImage(bytes: Buffer): boolean {
+  return (
+    bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE) ||
+    bytes.subarray(0, JPEG_SIGNATURE.length).equals(JPEG_SIGNATURE)
+  );
+}
+
+async function checkDestination(root: string, components: string[]): Promise<void> {
+  let entry = root;
+  for (const [index, component] of components.entries()) {
+    entry = path.join(entry, component);
+    const stats = await fsp.lstat(entry).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (!stats) return;
+    const last = index === components.length - 1;
+    if (stats.isSymbolicLink()) {
+      throw new StagehandFacadeInputError(
+        last ? SCREENSHOT_ARTIFACT_FILE_SYMLINK_ERROR : SCREENSHOT_ARTIFACT_SYMLINK_ERROR,
+      );
+    }
+    if (last && !stats.isFile()) {
+      throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_NOT_FILE_ERROR);
+    }
+    if (!last && !stats.isDirectory()) {
+      throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_NOT_DIRECTORY_ERROR);
+    }
+  }
+}
+
+async function chainUnchanged(
+  chain: { directory: string; dev: number; ino: number }[],
+): Promise<boolean> {
+  for (const { directory, dev, ino } of chain) {
+    const stats = await fsp.lstat(directory).catch(() => undefined);
+    if (!stats || stats.dev !== dev || stats.ino !== ino) return false;
+  }
+  return true;
+}
+
+function checkArtifact(
+  root: string,
+  artifact: ScreenshotArtifact,
+): { components: string[]; bytes: Buffer } {
+  const relative = path.relative(root, path.resolve(root, artifact.path));
+  const components = relative.split(path.sep);
+  if (
+    !relative ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative) ||
+    components.some(
+      (component) =>
+        component.includes("\0") || (process.platform === "win32" && component.includes(":")),
+    )
+  ) {
+    throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_PATH_ERROR);
+  }
+  if (!ARTIFACT_EXTENSION.test(components.at(-1)!)) {
+    throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_TYPE_ERROR);
+  }
+  const bytes = Buffer.from(artifact.base64, "base64");
+  if (!isImage(bytes)) {
+    throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_CONTENT_ERROR);
+  }
+  if (components.some((component) => Buffer.byteLength(component) > MAX_NAME_BYTES)) {
+    throw new StagehandFacadeInputError(screenshotArtifactWriteError("ENAMETOOLONG"));
+  }
+  return { components, bytes };
+}
+
+export const FACADE_KEEPER_PAGE_URL = "about:blank";
+
+export class StagehandFacadeTools {
+  private readonly snapshotsByPage = new Map<string, SnapshotState>();
+  private queue: Promise<void> = Promise.resolve();
+  private loss: FacadeSessionLoss | undefined;
+  private keeper: Promise<string | undefined> | undefined;
+  private consecutiveDeadlines = 0;
+  private static readonly MAX_CONSECUTIVE_DEADLINES = 3;
+
+  private closed = false;
+  private closePromise: Promise<void> | undefined;
+  constructor(
+    private readonly stagehand: Stagehand,
+    private readonly options: StagehandFacadeToolsOptions = {},
+  ) {}
+
+  /** Set once a call has proven the browser session is gone; never cleared. */
+  get sessionLoss(): FacadeSessionLoss | undefined {
+    return this.loss;
+  }
+
+  /** Closes both the client and its owned browser, including keep-alive sessions. */
+  close(): Promise<void> {
+    this.closed = true;
+    return (this.closePromise ??= (async () => {
+      if (this.options.onCloseRequested) {
+        try {
+          await this.options.onCloseRequested();
+        } catch {
+          throw new StagehandFacadeCleanupError();
+        }
+        return;
+      }
+      let failed = false;
+      for (const close of [() => this.stagehand.close(), () => this.stagehand.browser.close()]) {
+        try {
+          await close();
+        } catch {
+          failed = true;
+        }
+      }
+      if (failed) throw new StagehandFacadeCleanupError();
+    })());
+  }
+
+  snapshot(options: { includeIframes?: boolean } = {}): Promise<string> {
+    return this.enqueue("snapshot", () => this.snapshotNow(options));
+  }
+
+  screenshot(
+    options: { fullPage?: boolean; type?: "png" | "jpeg"; quality?: number } = {},
+  ): Promise<StagehandFacadeScreenshot> {
+    return this.enqueue("screenshot", () => this.screenshotNow(options));
+  }
+
+  runActions(actions: RefAction[]): Promise<{ completed: number; url: string }> {
+    return this.enqueue("run", () => this.runActionsNow(actions));
+  }
+
+  run(code: string): Promise<unknown> {
+    return this.enqueue("run", () => this.runNow(code));
+  }
+
+  private async snapshotNow(options: { includeIframes?: boolean }): Promise<string> {
+    const page = await this.activePage();
+    this.snapshotsByPage.delete(page.pageId);
+    const { snapshot, url } = await withDeadline(
+      (async () => {
+        const snapshot = await page.snapshot({
+          includeIframes: options.includeIframes ?? true,
+          timeout: 0,
+        });
+        return { snapshot, url: await page.url() };
+      })(),
+      PAGE_CAPTURE_DEADLINE_MS,
+      "page.snapshot",
+    );
+    this.snapshotsByPage.set(page.pageId, { url, xpathById: { ...snapshot.xpathMap } });
+    return snapshot.formattedTree;
+  }
+
+  private async screenshotNow(options: {
+    fullPage?: boolean;
+    type?: "png" | "jpeg";
+    quality?: number;
+  }): Promise<StagehandFacadeScreenshot> {
+    const page = await this.activePage();
+    const type = options.type ?? "png";
+    // CDP only accepts quality for jpeg, and only as an integer.
+    const quality =
+      type === "jpeg" && options.quality !== undefined ? Math.round(options.quality) : undefined;
+    const bytes = await withDeadline(
+      page.screenshot({
+        type,
+        ...(options.fullPage === undefined ? {} : { fullPage: options.fullPage }),
+        ...(quality === undefined ? {} : { quality }),
+      }),
+      PAGE_CAPTURE_DEADLINE_MS,
+      "page.screenshot",
+    );
+    return {
+      data: Buffer.from(bytes).toString("base64"),
+      mimeType: type === "jpeg" ? "image/jpeg" : "image/png",
+    };
+  }
+
+  private async runActionsNow(actions: RefAction[]): Promise<{ completed: number; url: string }> {
+    const parsed = RefActionSchema.array().min(1).parse(actions);
+    const page = await this.activePage();
+    const snapshot = this.snapshotsByPage.get(page.pageId);
+    if (!snapshot) throw new StagehandFacadeInputError(NO_HYDRATED_SNAPSHOT_ERROR);
+
+    if ((await page.url()) !== snapshot.url) {
+      this.snapshotsByPage.delete(page.pageId);
+      throw new StagehandFacadeInputError(NAVIGATED_SNAPSHOT_ERROR);
+    }
+
+    const result = await this.stagehand.experimentalBatch(
+      actionRunner,
+      { actions: parsed, xpathById: snapshot.xpathById },
+      { page, timeout: RUN_BATCH_TIMEOUT_MS },
+    );
+    if (result?.staleId !== undefined) {
+      throw new StagehandFacadeInputError(staleSnapshotIdError(result.staleId));
+    }
+    return { completed: result?.completed ?? parsed.length, url: await page.url() };
+  }
+
+  private async runNow(code: string): Promise<unknown> {
+    const page = await this.activePage();
+    const callback = runCallback(code);
+    const startedAt = performance.now();
+    const keeperPageId = await this.keeper;
+    const quietWait = this.options.quietWait ?? RUN_OPTIONS.quietWait.default;
+    const input: RunInput = {
+      ...(keeperPageId && { hiddenPageIds: [keeperPageId] }),
+      ...(quietWait && { quietWait: true }),
+    };
+    const envelope = await this.runBatchWithActivePageFallback(callback, input, page);
+    if (!isRunEnvelope(envelope)) throw new StagehandFacadeInputError(RUN_RESULT_MALFORMED_ERROR);
+    let runError: unknown;
+    let runFailed = false;
+    try {
+      this.options.onRunReport?.({
+        telemetry: envelope.telemetry,
+        quietWait,
+        batchRoundTripMs: performance.now() - startedAt,
+        batchRuntimeMs: envelope.batchRuntimeMs,
+        closeRequested: envelope.closeRequested,
+      });
+      await this.writeScreenshotArtifacts(envelope.artifacts);
+      if (envelope.executionError) {
+        throw new StagehandFacadeExecutionError(envelope.executionError);
+      }
+      const valueBytes = Buffer.byteLength(JSON.stringify(envelope.value) ?? "");
+      if (valueBytes > RUN_RESULT_LIMITS.maxValueBytes) {
+        throw new StagehandFacadeInputError(RUN_VALUE_SIZE_ERROR);
+      }
+    } catch (error) {
+      runError = error;
+      runFailed = true;
+    }
+    if (envelope.closeRequested) {
+      try {
+        await this.close();
+      } catch (closeError) {
+        if (runFailed) {
+          throw new AggregateError([runError, closeError], "Run failed and cleanup also failed.");
+        }
+        throw closeError;
+      }
+    }
+    if (runFailed) throw runError;
+    return envelope.value;
+  }
+
+  private async runBatchWithActivePageFallback(
+    callback: ExperimentalBatchCallback<RunInput, RunEnvelope>,
+    input: RunInput,
+    page: Page,
+  ): Promise<unknown> {
+    try {
+      return await this.stagehand.experimentalBatch(callback, input, {
+        page,
+        timeout: RUN_BATCH_TIMEOUT_MS,
+      });
+    } catch (error) {
+      if (!(error instanceof Error) || !/callback batch page was not found/iu.test(error.message)) {
+        throw error;
+      }
+      const fallback = await this.activePage();
+      return await this.stagehand.experimentalBatch(callback, input, {
+        page: fallback,
+        timeout: RUN_BATCH_TIMEOUT_MS,
+      });
+    }
+  }
+
+  private async writeScreenshotArtifacts(artifacts: ScreenshotArtifact[]): Promise<void> {
+    if (artifacts.length === 0) return;
+    if (artifacts.length > RUN_RESULT_LIMITS.maxArtifacts) {
+      throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_COUNT_ERROR);
+    }
+    let totalBytes = 0;
+    for (const artifact of artifacts) {
+      const size = decodedBase64Length(artifact.base64);
+      if (size > RUN_RESULT_LIMITS.maxArtifactBytes) {
+        throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_SIZE_ERROR);
+      }
+      totalBytes += size;
+      if (totalBytes > RUN_RESULT_LIMITS.maxTotalArtifactBytes) {
+        throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_TOTAL_SIZE_ERROR);
+      }
+    }
+    try {
+      await this.writeArtifactFiles(artifacts);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (!(error instanceof StagehandFacadeInputError) && typeof code === "string") {
+        throw new StagehandFacadeInputError(screenshotArtifactWriteError(code));
+      }
+      throw error;
+    }
+  }
+
+  private async writeArtifactFiles(artifacts: ScreenshotArtifact[]): Promise<void> {
+    const configuredRoot = path.resolve(
+      this.options.artifactRoot || path.join(process.cwd(), DEFAULT_ARTIFACT_DIRECTORY),
+    );
+    const checked = artifacts.map((artifact) => checkArtifact(configuredRoot, artifact));
+    if (!this.options.artifactRoot) {
+      const stats = await fsp.lstat(configuredRoot).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (stats?.isSymbolicLink()) {
+        throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_SYMLINK_ERROR);
+      }
+    }
+    for (const { components } of checked) await checkDestination(configuredRoot, components);
+    await fsp.mkdir(configuredRoot, { recursive: true });
+    const root = await fsp.realpath(configuredRoot);
+    const rootStats = await fsp.lstat(root);
+    for (const { components, bytes } of checked) {
+      let directory = root;
+      const chain = [{ directory, dev: rootStats.dev, ino: rootStats.ino }];
+      for (const component of components.slice(0, -1)) {
+        directory = path.join(directory, component);
+        await fsp.mkdir(directory).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "EEXIST") throw error;
+        });
+        const stats = await fsp.lstat(directory);
+        if (stats.isSymbolicLink()) {
+          throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_SYMLINK_ERROR);
+        }
+        if (!stats.isDirectory()) {
+          throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_NOT_DIRECTORY_ERROR);
+        }
+        chain.push({ directory, dev: stats.dev, ino: stats.ino });
+      }
+      const target = path.join(directory, components.at(-1)!);
+      const existing = await fsp.lstat(target).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (existing?.isSymbolicLink()) {
+        throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_FILE_SYMLINK_ERROR);
+      }
+      if (existing && !existing.isFile()) {
+        throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_NOT_FILE_ERROR);
+      }
+      const temporary = path.join(directory, `.stagehand-${randomBytes(8).toString("hex")}.tmp`);
+      const file = await fsp.open(
+        temporary,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        try {
+          // A replaced file keeps its permissions; a new one is owner-only. Some
+          // filesystems (exFAT, SMB) refuse chmod; the file then stays owner-only.
+          if (existing) await file.chmod(existing.mode & 0o777).catch(() => undefined);
+          await file.writeFile(bytes);
+          // Node has no directory-relative opens, so the directory chain is
+          // re-verified, and the new file confirmed on its device, before the rename.
+          const { dev } = await file.stat();
+          if (dev !== chain.at(-1)!.dev || !(await chainUnchanged(chain))) {
+            throw new StagehandFacadeInputError(SCREENSHOT_ARTIFACT_SYMLINK_ERROR);
+          }
+        } finally {
+          await file.close();
+        }
+        await fsp.rename(temporary, target);
+      } catch (error) {
+        await fsp.rm(temporary, { force: true });
+        throw error;
+      }
+    }
+  }
+
+  private async activePage(): Promise<Page> {
+    const context = this.stagehand.browser.context;
+    const keeperPageId = await this.keeper;
+    let active: Page | undefined;
+    try {
+      active = await context.activePage();
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !error.message.includes(UNMANAGED_ACTIVE_PAGE_ERROR_MARKER)
+      ) {
+        throw error;
+      }
+      const visible = (await context.pages()).filter((page) => page.pageId !== keeperPageId);
+      return visible.at(-1) ?? (await context.newPage());
+    }
+    if (active && active.pageId !== keeperPageId) return active;
+    const visible = (await context.pages()).filter((page) => page.pageId !== keeperPageId);
+    const page = visible[0] ?? (await context.newPage());
+    await context.setActivePage(page);
+    return page;
+  }
+
+  private async ensureKeeperPage(): Promise<void> {
+    this.keeper ??= this.openKeeperPage().catch((error: unknown) => {
+      if (sessionLossCause(error) !== undefined) throw error;
+      return undefined;
+    });
+    try {
+      await this.keeper;
+    } catch (error) {
+      this.keeper = Promise.resolve(undefined);
+      throw error;
+    }
+  }
+
+  private async openKeeperPage(): Promise<string | undefined> {
+    if (this.options.keeperPage === false) return undefined;
+    const context = this.stagehand.browser.context;
+    const before = await context.activePage();
+    const keeper = await context.newPage(FACADE_KEEPER_PAGE_URL);
+    if (before) await context.setActivePage(before);
+    return keeper.pageId;
+  }
+
+  private enqueue<Result>(tool: string, operation: () => Promise<Result>): Promise<Result> {
+    const guarded = async (): Promise<Result> => {
+      if (this.loss) throw new StagehandFacadeSessionLostError(this.loss);
+      if (this.closed) throw new StagehandFacadeInputError(FACADE_BROWSER_CLOSED_ERROR);
+      try {
+        await this.ensureKeeperPage();
+        const value = await operation();
+        this.consecutiveDeadlines = 0;
+        return value;
+      } catch (error) {
+        if (error instanceof FacadeDeadlineError) {
+          this.consecutiveDeadlines += 1;
+          if (this.consecutiveDeadlines < StagehandFacadeTools.MAX_CONSECUTIVE_DEADLINES) {
+            throw error;
+          }
+          const cause = `executor unresponsive: ${this.consecutiveDeadlines} consecutive capture timeouts (last: ${error.message})`;
+          this.loss = { cause, tool, at: new Date().toISOString() };
+          this.notifySessionLost(this.loss);
+          throw new StagehandFacadeSessionLostError(this.loss);
+        }
+        const cause = sessionLossCause(error);
+        if (cause === undefined) throw error;
+        this.loss = { cause, tool, at: new Date().toISOString() };
+        this.notifySessionLost(this.loss);
+        throw new StagehandFacadeSessionLostError(this.loss);
+      }
+    };
+    const result = this.queue.then(guarded, guarded);
+    this.queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private notifySessionLost(loss: FacadeSessionLoss): void {
+    try {
+      void Promise.resolve(this.options.onSessionLost?.(loss)).catch(() => undefined);
+    } catch {}
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRunEnvelope(value: unknown): value is RunEnvelope {
+  if (!isRecord(value) || value.__stagehandPlaywrightCompat !== true) return false;
+  const { executionError, artifacts } = value;
+  return (
+    typeof value.closeRequested === "boolean" &&
+    typeof value.batchRuntimeMs === "number" &&
+    isRecord(value.telemetry) &&
+    Array.isArray(artifacts) &&
+    artifacts.every(
+      (artifact) =>
+        isRecord(artifact) &&
+        typeof artifact.path === "string" &&
+        isCanonicalBase64(artifact.base64),
+    ) &&
+    (executionError === undefined ||
+      executionError === null ||
+      (isRecord(executionError) &&
+        typeof executionError.name === "string" &&
+        typeof executionError.message === "string" &&
+        (executionError.stack === undefined || typeof executionError.stack === "string")))
+  );
+}
+
+/**
+ * Padded RFC 4648 base64, as btoa writes it. Node's decoder would also accept
+ * base64url, missing padding and stray characters, which other hosts' decoders
+ * refuse, so the caps would no longer agree across hosts.
+ */
+function isCanonicalBase64(value: unknown): value is string {
+  return (
+    typeof value === "string" && value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(value)
+  );
+}
+
+function decodedBase64Length(value: string): number {
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
+}
+
+class FacadeDeadlineError extends Error {
+  override readonly name = "FacadeDeadlineError";
+  constructor(operation: string, timeoutMs: number) {
+    super(`${operation} received no response within ${timeoutMs}ms`);
+  }
+}
+
+function withDeadline<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new FacadeDeadlineError(operation, timeoutMs)),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function sessionLossCause(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  if ((error as { facadeExecutionError?: boolean }).facadeExecutionError) return undefined;
+  switch (error.name) {
+    case "StagehandBatchTimeoutError": {
+      const { clientTimeout } = error as Error & { clientTimeout?: number };
+      return typeof clientTimeout === "number"
+        ? `batch received no response within ${clientTimeout}ms`
+        : "batch received no response before its client deadline";
+    }
+    case "CDPConnectionClosedError":
+      return cdpSessionLossCause(error);
+  }
+  if (/\bCDP connection closed\b/u.test(error.message)) return cdpSessionLossCause(error);
+  if (/\bRPC client is closed\b/u.test(error.message)) return "RPC client closed";
+  return undefined;
+}
+
+function cdpSessionLossCause(error: Error): string {
+  const messages = [error.message];
+  const seen = new Set<Error>([error]);
+  let cause = error.cause;
+  while (cause instanceof Error && !seen.has(cause)) {
+    seen.add(cause);
+    const code = (cause as Error & { code?: unknown }).code;
+    const label =
+      typeof code === "string" || typeof code === "number" ? `${cause.name} [${code}]` : cause.name;
+    messages.push(cause.message ? `${label}: ${cause.message}` : label);
+    cause = cause.cause;
+  }
+  return sanitizeErrorMessage(messages.join("; caused by "));
+}

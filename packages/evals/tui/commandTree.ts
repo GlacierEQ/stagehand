@@ -1,66 +1,30 @@
-/**
- * Command tree for the evals TUI.
- *
- * Models the user-visible command surface as a tree:
- *   root → run, list, new, config{path,set,reset,core{path,set,reset,setup}},
- *          experiments{list,show,open,compare}
- *
- * Both the REPL (tui/repl.ts) and argv mode (cli.ts) build the same tree
- * via `buildCommandTree()` and dispatch user input through it. This is the
- * single source of truth for which commands exist and how they nest.
- *
- * Resolution rules (see resolveCommand):
- *   - Commands resolve relative to the current context (REPL contextPath).
- *   - The leading sigil `evals` strips itself and resolves the remainder
- *     from root — mirrors `evals X Y` from the shell.
- *   - Bare `evals` pops all context to root.
- *   - Meta commands (.., help, ?, exit/quit/q, clear, --help/-h) short-
- *     circuit before tree resolution and work at any depth.
- *
- * Existing handlers in tui/commands/* are wrapped, never rewritten.
- */
-
 import process from "node:process";
 import type { TaskRegistry } from "../framework/types.js";
 import { tokenize } from "./tokenize.js";
 import { bb, cyan, dim } from "./format.js";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-export type CommandHandler = (
-  args: string[],
-  ctx: CommandContext,
-) => Promise<void> | void;
+export type CommandHandler = (args: string[], ctx: CommandContext) => Promise<void> | void;
 
 export type CommandNode = {
-  /** Canonical lowercase name. */
   name: string;
   aliases?: readonly string[];
   summary: string;
-  /** If present, executable as a leaf with the given args. */
   handler?: CommandHandler;
-  /** If present, descendable as a namespace. */
   children?: readonly CommandNode[];
-  /** Per-node help printer. Receives the absolute path that was resolved. */
   printHelp?: (subPath: readonly string[]) => void | Promise<void>;
-  /** Hidden from auto-listings (still resolvable). */
   hidden?: boolean;
 };
 
 export type CommandContext = {
   entryDir: string;
-  /** Lazy registry accessor — REPL caches, argv discovers on first call. */
   getRegistry: () => Promise<TaskRegistry>;
   setRegistry: (r: TaskRegistry) => void;
-  /** Mutable in REPL (the run leaf assigns/clears); null in argv. */
   abortRef: { current: AbortController | null } | null;
-  /** Mutable string[] in REPL; null in argv. Mutated via the helpers below. */
   contextPath: string[] | null;
   pushContext?: (segment: string) => void;
   popContext?: () => void;
   setContextPath?: (path: readonly string[]) => void;
+  suspendInput?: () => () => void;
 };
 
 export type Resolution =
@@ -69,13 +33,7 @@ export type Resolution =
   | { kind: "run"; node: CommandNode; args: string[]; absolutePath: string[] }
   | { kind: "unknown"; token: string; context: readonly string[] };
 
-export type MetaName =
-  | "back"
-  | "to-root"
-  | "exit"
-  | "clear"
-  | "help"
-  | "help-q";
+export type MetaName = "back" | "to-root" | "exit" | "clear" | "help" | "help-q";
 
 const META_NAMES: Record<string, MetaName> = {
   "..": "back",
@@ -89,14 +47,7 @@ const META_NAMES: Record<string, MetaName> = {
   "-h": "help",
 };
 
-// ---------------------------------------------------------------------------
-// Tree walking + resolution
-// ---------------------------------------------------------------------------
-
-export function findChild(
-  node: CommandNode,
-  token: string,
-): CommandNode | undefined {
+export function findChild(node: CommandNode, token: string): CommandNode | undefined {
   if (!node.children) return undefined;
   const lower = token.toLowerCase();
   return node.children.find(
@@ -106,10 +57,7 @@ export function findChild(
   );
 }
 
-export function walkPath(
-  root: CommandNode,
-  path: readonly string[],
-): CommandNode {
+export function walkPath(root: CommandNode, path: readonly string[]): CommandNode {
   let node = root;
   for (const seg of path) {
     const child = findChild(node, seg);
@@ -125,11 +73,6 @@ type Match = {
   remaining: string[];
 };
 
-/**
- * Greedy walk: consume each leading token that matches a child of the
- * current node. Stop at the first non-match — those tokens become args
- * for the deepest matched node's handler.
- */
 function matchPath(start: CommandNode, tokens: readonly string[]): Match {
   let node = start;
   const matched: string[] = [];
@@ -157,8 +100,6 @@ export function resolveCommand(
     return { kind: "meta", name: meta, args: tokens.slice(1) };
   }
 
-  // Leading sigil: `evals` strips itself and resolves the remainder
-  // from root, regardless of current context.
   if (first === "evals") {
     const rest = tokens.slice(1);
     if (rest.length === 0) {
@@ -176,7 +117,6 @@ export function resolveCommand(
     return { kind: "unknown", token: rest[0], context: [] };
   }
 
-  // Relative — match against the current context, no root fallback.
   const current = walkPath(root, contextPath);
   const m = matchPath(current, tokens);
   if (m.matchedNames.length > 0) {
@@ -191,18 +131,10 @@ export function resolveCommand(
   return { kind: "unknown", token: tokens[0], context: contextPath };
 }
 
-// ---------------------------------------------------------------------------
-// Prompt rendering
-// ---------------------------------------------------------------------------
-
 export function renderPrompt(contextPath: readonly string[]): string {
   const segs = contextPath.map((p) => `${cyan(p)} ${dim(">")} `).join("");
   return `${bb("evals")} ${dim(">")} ${segs}`;
 }
-
-// ---------------------------------------------------------------------------
-// Dispatch
-// ---------------------------------------------------------------------------
 
 export type DispatchOutcome =
   | { kind: "noop" }
@@ -210,13 +142,6 @@ export type DispatchOutcome =
   | { kind: "help" }
   | { kind: "ran"; absolutePath: string[] };
 
-/**
- * Resolve `tokens` against the tree and execute the result. Caller owns
- * error handling and prompt reprinting.
- *
- * Returns an outcome the caller can inspect — cli.ts uses it to decide
- * whether the invocation counts as a "first use" for the welcome marker.
- */
 export async function dispatch(
   root: CommandNode,
   tokens: string[],
@@ -233,13 +158,8 @@ export async function dispatch(
       return { kind: "meta" };
 
     case "run": {
-      // Help is only triggered when `help` / `--help` / `-h` sits IMMEDIATELY
-      // after the matched path. Later positions are arguments or flag values
-      // and must reach the handler unchanged (e.g. `config set trials --help`
-      // must surface a parse error, not silently print help).
       const first = result.args[0];
-      const wantsHelp =
-        first === "help" || first === "--help" || first === "-h";
+      const wantsHelp = first === "help" || first === "--help" || first === "-h";
       if (wantsHelp && result.node.printHelp) {
         await result.node.printHelp(result.absolutePath);
         return { kind: "help" };
@@ -248,23 +168,13 @@ export async function dispatch(
       if (result.node.handler) {
         await result.node.handler(result.args, ctx);
       } else if (result.args.length > 0) {
-        throw new Error(
-          `Unknown subcommand "${result.args[0]}" in ${pretty(
-            result.absolutePath,
-          )}`,
-        );
+        throw new Error(`Unknown subcommand "${result.args[0]}" in ${pretty(result.absolutePath)}`);
       } else if (result.node.printHelp) {
         await result.node.printHelp(result.absolutePath);
         return { kind: "help" };
       }
 
-      // Descend on bare (REPL only). `config` and `config core` already
-      // printed via their handler; `experiments` printed via printHelp.
-      if (
-        ctx.contextPath !== null &&
-        result.node.children &&
-        result.args.length === 0
-      ) {
+      if (ctx.contextPath !== null && result.node.children && result.args.length === 0) {
         const target = result.absolutePath;
         const same =
           target.length === ctx.contextPath.length &&
@@ -277,15 +187,10 @@ export async function dispatch(
     }
 
     case "unknown": {
-      // Unknown-token shorthand at root: hand off to the run leaf so
-      // `evals act` keeps working. Only at root — at depth this errors.
       if (result.context.length === 0) {
         const runNode = findChild(root, "run");
         if (runNode?.handler) {
-          // Strip a leading "evals" sigil so parseRunArgs doesn't
-          // misinterpret it as a target or flag.
-          const forwarded =
-            tokens[0]?.toLowerCase() === "evals" ? tokens.slice(1) : tokens;
+          const forwarded = tokens[0]?.toLowerCase() === "evals" ? tokens.slice(1) : tokens;
           await runNode.handler(forwarded, ctx);
           return { kind: "ran", absolutePath: ["run"] };
         }
@@ -315,9 +220,16 @@ async function runMeta(
     }
 
     case "to-root": {
-      // Bare `evals` mid-line. In REPL, pop all context. In argv, no-op.
       if (ctx.contextPath === null) return;
       ctx.setContextPath?.([]);
+      return;
+    }
+
+    case "clear": {
+      if (ctx.contextPath === null) {
+        throw new Error("`clear` is not available outside the REPL");
+      }
+      console.clear();
       return;
     }
 
@@ -327,13 +239,6 @@ async function runMeta(
       }
       console.log(dim("\n  Goodbye.\n"));
       process.exit(0);
-    }
-    // eslint-disable-next-line no-fallthrough -- exit terminates
-    case "clear": {
-      if (ctx.contextPath === null) {
-        throw new Error("`clear` is not available outside the REPL");
-      }
-      console.clear();
       return;
     }
 
@@ -343,7 +248,6 @@ async function runMeta(
       const current = walkPath(root, path);
 
       if (args.length > 0) {
-        // `help <child>` — resolve relative to current context.
         const m = matchPath(current, args);
         if (m.matchedNames.length > 0 && m.node.printHelp) {
           await m.node.printHelp([...path, ...m.matchedNames]);
@@ -376,19 +280,7 @@ function unknownMessage(token: string, context: readonly string[]): string {
   )}. Type "evals ${token} …" to run from root, "help" to see subcommands here, or ".." to leave the context.`;
 }
 
-// ---------------------------------------------------------------------------
-// Tree factory — wraps existing handlers as leaf nodes.
-// ---------------------------------------------------------------------------
-
-/**
- * Build the canonical command tree. The factory is parameter-less because
- * leaves close over the `CommandContext` they receive at dispatch time —
- * the same tree instance can serve REPL (with abortRef + contextPath) and
- * argv (both null) contexts.
- */
 export function buildCommandTree(): CommandNode {
-  // Help printers are imported lazily to avoid pulling braintrust into
-  // quiet commands like `config path`.
   const help = async () => import("./commands/help.js");
 
   const runNode: CommandNode = {
@@ -396,9 +288,7 @@ export function buildCommandTree(): CommandNode {
     summary: "Run evals",
     printHelp: async () => (await help()).printRunHelp(),
     handler: async (args, ctx) => {
-      const { parseRunArgs, resolveRunOptions } = await import(
-        "./commands/parse.js"
-      );
+      const { parseRunArgs, resolveRunOptions } = await import("./commands/parse.js");
       const { readConfig } = await import("./commands/config.js");
       const { runCommand } = await import("./commands/run.js");
 
@@ -409,23 +299,21 @@ export function buildCommandTree(): CommandNode {
         configFile.defaults,
         process.env,
         configFile.core,
+        configFile.tracing,
+        {
+          benchmarks: configFile.benchmarks,
+          harnesses: configFile.harnesses,
+          providers: configFile.providers,
+          verifier: configFile.verifier,
+          campaign: configFile.campaign,
+        },
       );
 
-      // Argv mode (no abortRef): handle --legacy here, mirroring cli.ts.
       if (ctx.abortRef === null) {
-        if (flags.legacy) {
-          const { runLegacy } = await import("./commands/legacy.js");
-          const { discoverTasks } = await import("../framework/discovery.js");
-          const { getRuntimeTasksRoot } = await import("../runtimePaths.js");
-          const registry = await discoverTasks(getRuntimeTasksRoot(), false);
-          await runLegacy(resolved, flags, registry);
-          return;
-        }
         await runCommand(resolved);
         return;
       }
 
-      // REPL mode: pass abort signal so Esc can cancel.
       const registry = await ctx.getRegistry();
       ctx.abortRef.current = new AbortController();
       try {
@@ -456,7 +344,6 @@ export function buildCommandTree(): CommandNode {
     handler: async (args, ctx) => {
       const { scaffoldTask } = await import("./commands/new.js");
       const task = scaffoldTask(args);
-      // REPL: re-discover so the new task is immediately resolvable.
       if (task && ctx.abortRef !== null) {
         const { discoverTasks } = await import("../framework/discovery.js");
         const { getRuntimeTasksRoot } = await import("../runtimePaths.js");
@@ -466,13 +353,7 @@ export function buildCommandTree(): CommandNode {
     },
   };
 
-  // ---- config (leaf + children) ----
-  // All `config core` leaves share the same help page (printConfigCoreHelp);
-  // all `config` leaves share printConfigHelp. Setting printHelp on each leaf
-  // makes `evals config core <leaf> help` resolve here in dispatch — leaves
-  // never hand a stray "help" token to their wrapped handler.
-  const printConfigCoreHelpThunk = async () =>
-    (await help()).printConfigCoreHelp();
+  const printConfigCoreHelpThunk = async () => (await help()).printConfigCoreHelp();
   const printConfigHelpThunk = async () => (await help()).printConfigHelp();
 
   const configCorePath: CommandNode = {
@@ -523,13 +404,52 @@ export function buildCommandTree(): CommandNode {
     children: [configCorePath, configCoreSet, configCoreReset, configCoreSetup],
   };
 
+  const printConfigTracingHelpThunk = async () => (await help()).printConfigTracingHelp();
+  const configTracingPath: CommandNode = {
+    name: "path",
+    summary: "Print the config file path",
+    printHelp: printConfigTracingHelpThunk,
+    handler: async (_args, ctx) => {
+      const { handleTracing } = await import("./commands/tracing.js");
+      await handleTracing(["path"], ctx.entryDir);
+    },
+  };
+  const configTracingSet: CommandNode = {
+    name: "set",
+    summary: "Set transport / braintrustProject / langsmithProject",
+    printHelp: printConfigTracingHelpThunk,
+    handler: async (args, ctx) => {
+      const { handleTracing } = await import("./commands/tracing.js");
+      await handleTracing(["set", ...args], ctx.entryDir);
+    },
+  };
+  const configTracingReset: CommandNode = {
+    name: "reset",
+    summary: "Reset tracing configuration",
+    printHelp: printConfigTracingHelpThunk,
+    handler: async (args, ctx) => {
+      const { handleTracing } = await import("./commands/tracing.js");
+      await handleTracing(["reset", ...args], ctx.entryDir);
+    },
+  };
+  const configTracing: CommandNode = {
+    name: "tracing",
+    summary: "Configure trace transport + sink projects",
+    printHelp: printConfigTracingHelpThunk,
+    handler: async (args, ctx) => {
+      const { handleTracing } = await import("./commands/tracing.js");
+      await handleTracing(args, ctx.entryDir);
+    },
+    children: [configTracingPath, configTracingSet, configTracingReset],
+  };
+
   const configPath: CommandNode = {
     name: "path",
-    summary: "Print the evals.config.json file path",
+    summary: "Print the tracked (or local) config file path",
     printHelp: printConfigHelpThunk,
-    handler: async (_args, ctx) => {
+    handler: async (args, ctx) => {
       const { handleConfig } = await import("./commands/config.js");
-      await handleConfig(["path"], ctx.entryDir);
+      await handleConfig(["path", ...args], ctx.entryDir);
     },
   };
   const configSet: CommandNode = {
@@ -556,22 +476,16 @@ export function buildCommandTree(): CommandNode {
     summary: "Get/set default run configuration",
     printHelp: async () => (await help()).printConfigHelp(),
     handler: async (args, ctx) => {
-      // matchPath strips known children (path/set/reset/core) before
-      // we get here, so any args remaining are unknown subcommands —
-      // delegate to handleConfig which prints the right error.
-      const { handleConfig, printConfig } = await import(
-        "./commands/config.js"
-      );
+      const { handleConfig, printConfig } = await import("./commands/config.js");
       if (args.length === 0) {
         printConfig(ctx.entryDir);
         return;
       }
       await handleConfig(args, ctx.entryDir);
     },
-    children: [configPath, configSet, configReset, configCore],
+    children: [configPath, configSet, configReset, configCore, configTracing],
   };
 
-  // ---- experiments (pure namespace) ----
   const experimentsList: CommandNode = {
     name: "list",
     summary: "Show recent runs",
@@ -614,32 +528,54 @@ export function buildCommandTree(): CommandNode {
     summary: "Inspect Braintrust experiment runs",
     printHelp: async () => (await help()).printExperimentsHelp(),
     handler: async (args) => {
-      // Bare invocation prints help (preserves today's `evals experiments`
-      // behavior). With an unknown trailing token, error out.
       if (args.length > 0) {
         throw new Error(`Unknown experiments subcommand "${args[0]}"`);
       }
       const { printExperimentsHelp } = await import("./commands/help.js");
       printExperimentsHelp();
     },
-    children: [
-      experimentsList,
-      experimentsShow,
-      experimentsOpen,
-      experimentsCompare,
-    ],
+    children: [experimentsList, experimentsShow, experimentsOpen, experimentsCompare],
   };
 
   const doctorNode: CommandNode = {
     name: "doctor",
     aliases: ["health"],
     summary: "Health report (env keys, config, discovery)",
-    printHelp: async () =>
-      (await import("./commands/doctor.js")).printDoctorHelp(),
+    printHelp: async () => (await import("./commands/doctor.js")).printDoctorHelp(),
     handler: async (args, ctx) => {
       const { handleDoctor } = await import("./commands/doctor.js");
       const exitCode = await handleDoctor(args, ctx.entryDir);
       if (exitCode !== 0) process.exitCode = exitCode;
+    },
+  };
+
+  const setupNode: CommandNode = {
+    name: "setup",
+    summary: "Guided setup for agent benchmarks (provider key, browser)",
+    printHelp: async () => (await import("./commands/setup.js")).printSetupHelp(),
+    handler: async (args, ctx) => {
+      const { handleSetup } = await import("./commands/setup.js");
+      await handleSetup(args, ctx);
+    },
+  };
+
+  const welcomeNode: CommandNode = {
+    name: "welcome",
+    summary: "Guided onboarding on a real benchmark task",
+    printHelp: async () => (await import("./welcome/index.js")).printWelcomeHelp(),
+    handler: async (args, ctx) => {
+      const { handleWelcome } = await import("./welcome/index.js");
+      await handleWelcome(args, ctx);
+    },
+  };
+
+  const verifyNode: CommandNode = {
+    name: "verify",
+    summary: "Re-score a saved trajectory",
+    printHelp: async () => (await import("./commands/verify.js")).printVerifyHelp(),
+    handler: async (args) => {
+      const { handleVerify } = await import("./commands/verify.js");
+      await handleVerify(args);
     },
   };
 
@@ -653,16 +589,15 @@ export function buildCommandTree(): CommandNode {
       configNode,
       experimentsNode,
       newNode,
+      verifyNode,
       doctorNode,
+      setupNode,
+      welcomeNode,
     ],
   };
 
   return root;
 }
-
-// ---------------------------------------------------------------------------
-// Argv tokenization: re-split args that contain `>` (e.g. from `\>` in shell).
-// ---------------------------------------------------------------------------
 
 /**
  * Re-tokenize a shell-split argv array on `>` boundaries.
@@ -690,5 +625,4 @@ export function tokenizeArgv(args: readonly string[]): string[] {
   return out;
 }
 
-// Re-export tokenize so callers only import from one place.
 export { tokenize };

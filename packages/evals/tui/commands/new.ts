@@ -1,10 +1,3 @@
-/**
- * Scaffold command — generates a new task file with the right boilerplate.
- *
- * Usage: evals new core navigation my_task
- *        evals new bench act my_task
- */
-
 import fs from "node:fs";
 import path from "node:path";
 import { cyan, dim, green, red } from "../format.js";
@@ -33,6 +26,37 @@ const BENCH_TEMPLATE = (
 ) => `import { defineBenchTask } from "../../../framework/defineTask.js";
 
 export default defineBenchTask(
+  { name: "${name}" },
+  async ({ stagehand, page, logger, debugUrl, sessionUrl }) => {
+    try {
+      await page.goto("https://example.com");
+
+      // TODO: implement eval logic
+
+      return {
+        _success: true,
+        logs: logger.getLogs(),
+        debugUrl,
+        sessionUrl,
+      };
+    } catch (error) {
+      return {
+        _success: false,
+        error,
+        debugUrl,
+        sessionUrl,
+        logs: logger.getLogs(),
+      };
+    }
+  },
+);
+`;
+
+const AGENT_BENCH_TEMPLATE = (
+  name: string,
+) => `import { defineAgentBenchTask } from "../../../framework/defineTask.js";
+
+export default defineAgentBenchTask(
   { name: "${name}" },
   async ({ v3, logger, debugUrl, sessionUrl }) => {
     try {
@@ -93,11 +117,7 @@ export function scaffoldTask(args: string[]): ScaffoldedTask | null {
   }
 
   if (!/^[a-z][a-z0-9_]*$/.test(name)) {
-    console.log(
-      red(
-        `  Invalid name "${name}". Use lowercase letters, numbers, underscores.`,
-      ),
-    );
+    console.log(red(`  Invalid name "${name}". Use lowercase letters, numbers, underscores.`));
     return null;
   }
 
@@ -106,10 +126,7 @@ export function scaffoldTask(args: string[]): ScaffoldedTask | null {
     tier === "core"
       ? path.join(packageRoot, "core", "tasks")
       : path.join(packageRoot, "tasks", tier);
-  const taskDir =
-    tier === "core"
-      ? path.join(taskRoot, category)
-      : path.join(taskRoot, category);
+  const taskDir = tier === "core" ? path.join(taskRoot, category) : path.join(taskRoot, category);
   const taskFile = path.join(taskDir, `${name}.ts`);
   const relativeTaskFile = path.relative(taskRoot, taskFile);
   if (relativeTaskFile.startsWith("..") || path.isAbsolute(relativeTaskFile)) {
@@ -124,13 +141,16 @@ export function scaffoldTask(args: string[]): ScaffoldedTask | null {
 
   fs.mkdirSync(taskDir, { recursive: true });
 
-  const content = tier === "core" ? CORE_TEMPLATE(name) : BENCH_TEMPLATE(name);
+  const content =
+    tier === "core"
+      ? CORE_TEMPLATE(name)
+      : category === "agent"
+        ? AGENT_BENCH_TEMPLATE(name)
+        : BENCH_TEMPLATE(name);
   fs.writeFileSync(taskFile, content);
 
   const displayPath =
-    tier === "core"
-      ? `core/tasks/${category}/${name}.ts`
-      : `tasks/${tier}/${category}/${name}.ts`;
+    tier === "core" ? `core/tasks/${category}/${name}.ts` : `tasks/${tier}/${category}/${name}.ts`;
   console.log(green(`  Created: `) + cyan(displayPath));
   console.log(dim("  Task will be auto-discovered on next run."));
 

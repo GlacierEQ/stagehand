@@ -1,5 +1,5 @@
 import type { Testcase, EvalInput, AgentModelEntry } from "../types/evals.js";
-import type { AvailableModel } from "@browserbasehq/stagehand";
+import { normalizeRubric, type AvailableModel } from "stagehand-v3";
 import { tasksConfig } from "../taskConfig.js";
 import { getPackageRootDir } from "../runtimePaths.js";
 import {
@@ -9,15 +9,12 @@ import {
   normalizeAgentModelEntries,
 } from "../utils.js";
 
-export const buildWebTailBenchTestcases = (
-  models: string[] | AgentModelEntry[],
-): Testcase[] => {
+export const buildWebTailBenchTestcases = (models: string[] | AgentModelEntry[]): Testcase[] => {
   const webtailbenchFilePath =
     getPackageRootDir() + "/datasets/webtailbench/WebTailBench_data.jsonl";
 
   const lines = readJsonlFile(webtailbenchFilePath);
 
-  // Use EVAL_MAX_K if set, otherwise fall back to EVAL_WEBTAILBENCH_LIMIT or default to 25
   const maxCases = process.env.EVAL_MAX_K
     ? Number(process.env.EVAL_MAX_K)
     : process.env.EVAL_WEBTAILBENCH_LIMIT
@@ -32,6 +29,7 @@ export const buildWebTailBenchTestcases = (
     ques: string;
     category?: string;
     web?: string;
+    precomputed_rubric?: unknown;
     [key: string]: unknown;
   };
 
@@ -42,7 +40,19 @@ export const buildWebTailBenchTestcases = (
   }
 
   const candidates = parseJsonlRows(lines, isWebTailBenchRow);
-  const rows = applySampling(candidates, sampleCount, maxCases);
+
+  const explicitIds = process.env.EVAL_WEBTAILBENCH_IDS
+    ? process.env.EVAL_WEBTAILBENCH_IDS.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : null;
+  let rows: WebTailBenchRow[];
+  if (explicitIds && explicitIds.length > 0) {
+    const byId = new Map(candidates.map((r) => [r.id, r]));
+    rows = explicitIds.map((id) => byId.get(id)).filter((r): r is WebTailBenchRow => Boolean(r));
+  } else {
+    rows = applySampling(candidates, sampleCount, maxCases);
+  }
 
   const allTestcases: Testcase[] = [];
   for (const modelEntry of normalizeAgentModelEntries(models)) {
@@ -57,10 +67,10 @@ export const buildWebTailBenchTestcases = (
           category: row.category,
           ques: row.ques,
           web: row.web,
+          precomputed_rubric: normalizeRubric(row.precomputed_rubric),
         },
       };
-      const taskCategories =
-        tasksConfig.find((t) => t.name === input.name)?.categories || [];
+      const taskCategories = tasksConfig.find((t) => t.name === input.name)?.categories || [];
       allTestcases.push({
         input,
         name: input.name,

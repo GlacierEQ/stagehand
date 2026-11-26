@@ -1,9 +1,3 @@
-/**
- * Initializes a V3 instance for use in evaluations without modifying
- * the existing Stagehand-based init flow. Tasks can gradually migrate
- * to consume `v3` directly.
- */
-
 import type {
   AvailableCuaModel,
   AvailableModel,
@@ -15,33 +9,28 @@ import type {
   ModelConfiguration,
   V3Options,
   AgentModelConfig,
-} from "@browserbasehq/stagehand";
-import {
-  loadApiKeyFromEnv,
-  modelToAgentProviderMap,
-  V3,
-} from "@browserbasehq/stagehand";
+} from "stagehand-v3";
+import { loadApiKeyFromEnv, modelToAgentProviderMap, V3 } from "stagehand-v3";
 import { getEnv } from "./env.js";
 import { EvalLogger } from "./logger.js";
 
 type InitV3Args = {
   llmClient?: LLMClient;
   modelClientOptions?: ClientOptions;
-  domSettleTimeoutMs?: number; // retained for parity; v3 handlers accept timeouts per-call
+  domSettleTimeoutMs?: number;
   logger: EvalLogger;
-  createAgent?: boolean; // only create an agent for agent tasks
+  createAgent?: boolean;
   agentMode?: AgentToolMode;
   isCUA?: boolean;
   configOverrides?: {
     env?: "LOCAL" | "BROWSERBASE";
     localBrowserLaunchOptions?: Partial<LocalBrowserLaunchOptions>;
-    // Back-compat alias for args
     chromeFlags?: string[];
     browserbaseSessionCreateParams?: V3Options["browserbaseSessionCreateParams"];
     browserbaseSessionID?: V3Options["browserbaseSessionID"];
     experimental?: boolean;
   };
-  actTimeoutMs?: number; // retained for parity (v3 agent tools don't use this globally)
+  actTimeoutMs?: number;
   modelName: AvailableModel;
   verbose?: boolean;
 };
@@ -66,19 +55,13 @@ export async function initV3({
   isCUA,
   verbose = false,
 }: InitV3Args): Promise<V3InitResult> {
-  // If CUA, choose a safe internal AISDK model for V3 handlers based on available API keys
   let internalModel: AvailableModel = modelName;
-  const resolvedAgentMode: AgentToolMode | undefined =
-    agentMode ?? (isCUA ? "cua" : undefined);
+  const resolvedAgentMode: AgentToolMode | undefined = agentMode ?? (isCUA ? "cua" : undefined);
   const isCuaMode = resolvedAgentMode === "cua";
 
   if (isCuaMode) {
-    if (process.env.OPENAI_API_KEY)
-      internalModel = "openai/gpt-4.1-mini" as AvailableModel;
-    else if (
-      process.env.GEMINI_API_KEY ||
-      process.env.GOOGLE_GENERATIVE_AI_API_KEY
-    )
+    if (process.env.OPENAI_API_KEY) internalModel = "openai/gpt-4.1-mini" as AvailableModel;
+    else if (process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY)
       internalModel = "google/gemini-2.0-flash" as AvailableModel;
     else if (process.env.ANTHROPIC_API_KEY)
       internalModel = "anthropic/claude-sonnet-4-6" as AvailableModel;
@@ -101,24 +84,21 @@ export async function initV3({
     apiKey: process.env.BROWSERBASE_API_KEY,
     projectId: process.env.BROWSERBASE_PROJECT_ID,
     localBrowserLaunchOptions: {
-      ...(configOverrides?.localBrowserLaunchOptions ?? {}),
+      ...configOverrides?.localBrowserLaunchOptions,
       headless: configOverrides?.localBrowserLaunchOptions?.headless ?? false,
-      args:
-        configOverrides?.localBrowserLaunchOptions?.args ??
-        configOverrides?.chromeFlags,
+      args: configOverrides?.localBrowserLaunchOptions?.args ?? configOverrides?.chromeFlags,
     },
     model: resolvedModelConfig,
     experimental:
       typeof configOverrides?.experimental === "boolean"
-        ? configOverrides.experimental && process.env.USE_API !== "true" // experimental only when not using API
+        ? configOverrides.experimental && process.env.USE_API !== "true"
         : false,
     verbose: verbose ? 2 : 0,
-    browserbaseSessionCreateParams:
-      configOverrides?.browserbaseSessionCreateParams,
+    browserbaseSessionCreateParams: configOverrides?.browserbaseSessionCreateParams,
     browserbaseSessionID: configOverrides?.browserbaseSessionID,
     selfHeal: true,
     disablePino: true,
-    disableAPI: process.env.USE_API !== "true", // Negate: USE_API=true → disableAPI=false
+    disableAPI: process.env.USE_API !== "true",
     serverCache: false,
     logger: logger.log.bind(logger),
   };
@@ -129,16 +109,13 @@ export async function initV3({
 
   const v3 = new V3(v3Options);
 
-  // Associate the logger with the V3 instance
   logger.init(v3);
   await v3.init();
 
   let agent: AgentInstance | undefined;
   if (createAgent) {
     if (isCuaMode) {
-      const shortModelName = modelName.includes("/")
-        ? modelName.split("/")[1]
-        : modelName;
+      const shortModelName = modelName.includes("/") ? modelName.split("/")[1] : modelName;
 
       const providerType = modelToAgentProviderMap[shortModelName];
       if (!providerType) {

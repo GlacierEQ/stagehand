@@ -1,16 +1,13 @@
-import { defineBenchTask } from "../../../framework/defineTask.js";
 import { z } from "zod";
+import { defineBenchTask } from "../../../framework/defineTask.js";
 
 export default defineBenchTask(
   { name: "extract_jfk_links" },
-  async ({ logger, debugUrl, sessionUrl, v3 }) => {
+  async ({ logger, debugUrl, sessionUrl, stagehand, page }) => {
     try {
-      const page = v3.context.pages()[0];
-      await page.goto(
-        "https://browserbase.github.io/stagehand-eval-sites/sites/jfk/",
-      );
+      await page.goto("https://stagehand-eval-sites.vercel.app/sites/jfk/");
 
-      const extraction = await v3.extract(
+      const { data: extraction } = await stagehand.extract(
         "extract all the record file name and their corresponding links",
         z.object({
           records: z.array(
@@ -22,7 +19,6 @@ export default defineBenchTask(
         }),
       );
 
-      // The list of records we expect to see
       const expectedRecords = [
         {
           file_name: "104-10003-10041.pdf",
@@ -68,14 +64,12 @@ export default defineBenchTask(
 
       const extractedRecords = extraction.records;
 
-      // Check that all expected records exist in the extraction
       const missingRecords = expectedRecords.filter((expected) => {
         return !extractedRecords.some(
           (r) => r.file_name === expected.file_name && r.link === expected.link,
         );
       });
 
-      // Check that the extraction array is exactly length 10
       if (extractedRecords.length !== 10) {
         return {
           _success: false,
@@ -98,7 +92,6 @@ export default defineBenchTask(
         };
       }
 
-      // If we reach here, the number of records is correct, and all are present
       return {
         _success: true,
         debugUrl,
@@ -108,13 +101,11 @@ export default defineBenchTask(
     } catch (error) {
       return {
         _success: false,
-        error: JSON.parse(JSON.stringify(error, null, 2)),
+        error: error instanceof Error ? error.message : String(error),
         debugUrl,
         sessionUrl,
         logs: logger.getLogs(),
       };
-    } finally {
-      await v3.close();
     }
   },
 );

@@ -19,9 +19,11 @@ import {
   LLMClient,
   LogLine,
   toJsonSchema,
-} from "@browserbasehq/stagehand";
+} from "stagehand-v3";
 
-type WrappedAI = ReturnType<(typeof import("braintrust"))["wrapAISDK"]>;
+// braintrust 3.x types wrapAISDK's return as `{}`, so derive the surface we
+// use from the `ai` module instead (the wrapper preserves these signatures).
+type WrappedAI = Pick<typeof ai, "generateText" | "generateObject" | "streamText" | "streamObject">;
 
 let wrappedAiPromise: Promise<WrappedAI> | undefined;
 
@@ -31,7 +33,7 @@ async function loadWrappedAISDK(): Promise<WrappedAI> {
       return ai as unknown as WrappedAI;
     }
     const { wrapAISDK } = await import("braintrust");
-    return wrapAISDK(ai);
+    return wrapAISDK(ai) as WrappedAI;
   })();
   return wrappedAiPromise;
 }
@@ -78,9 +80,7 @@ export class AISdkClientWrapped extends LLMClient {
               ...msg,
               content: Array.isArray(msg.content)
                 ? msg.content.map((c) =>
-                    "image_url" in c
-                      ? { ...c, image_url: { url: "[IMAGE_REDACTED]" } }
-                      : c,
+                    "image_url" in c ? { ...c, image_url: { url: "[IMAGE_REDACTED]" } } : c,
                   )
                 : msg.content,
             })),
@@ -94,60 +94,56 @@ export class AISdkClientWrapped extends LLMClient {
       },
     });
 
-    const formattedMessages: ModelMessage[] = options.messages.map(
-      (message) => {
-        if (Array.isArray(message.content)) {
-          if (message.role === "system") {
-            const systemMessage: CoreSystemMessage = {
-              role: "system",
-              content: message.content
-                .map((c) => ("text" in c ? c.text : ""))
-                .join("\n"),
-            };
-            return systemMessage;
-          }
-
-          const contentParts = message.content.map((content) => {
-            if ("image_url" in content) {
-              const imageContent: ImagePart = {
-                type: "image",
-                image: content.image_url.url,
-              };
-              return imageContent;
-            } else {
-              const textContent: TextPart = {
-                type: "text",
-                text: content.text,
-              };
-              return textContent;
-            }
-          });
-
-          if (message.role === "user") {
-            const userMessage: CoreUserMessage = {
-              role: "user",
-              content: contentParts,
-            };
-            return userMessage;
-          } else {
-            const textOnlyParts = contentParts.map((part) => ({
-              type: "text" as const,
-              text: part.type === "image" ? "[Image]" : part.text,
-            }));
-            const assistantMessage: CoreAssistantMessage = {
-              role: "assistant",
-              content: textOnlyParts,
-            };
-            return assistantMessage;
-          }
+    const formattedMessages: ModelMessage[] = options.messages.map((message) => {
+      if (Array.isArray(message.content)) {
+        if (message.role === "system") {
+          const systemMessage: CoreSystemMessage = {
+            role: "system",
+            content: message.content.map((c) => ("text" in c ? c.text : "")).join("\n"),
+          };
+          return systemMessage;
         }
 
-        return {
-          role: message.role,
-          content: message.content,
-        };
-      },
-    );
+        const contentParts = message.content.map((content) => {
+          if ("image_url" in content) {
+            const imageContent: ImagePart = {
+              type: "image",
+              image: content.image_url.url,
+            };
+            return imageContent;
+          } else {
+            const textContent: TextPart = {
+              type: "text",
+              text: content.text,
+            };
+            return textContent;
+          }
+        });
+
+        if (message.role === "user") {
+          const userMessage: CoreUserMessage = {
+            role: "user",
+            content: contentParts,
+          };
+          return userMessage;
+        } else {
+          const textOnlyParts = contentParts.map((part) => ({
+            type: "text" as const,
+            text: part.type === "image" ? "[Image]" : part.text,
+          }));
+          const assistantMessage: CoreAssistantMessage = {
+            role: "assistant",
+            content: textOnlyParts,
+          };
+          return assistantMessage;
+        }
+      }
+
+      return {
+        role: message.role,
+        content: message.content,
+      };
+    });
 
     const { generateObject, generateText } = await loadWrappedAISDK();
     let objectResponse: Awaited<ReturnType<typeof generateObject>>;
@@ -158,16 +154,12 @@ export class AISdkClientWrapped extends LLMClient {
     const isKimi = this.model.modelId.includes("kimi");
     const temperature = isKimi ? 1 : options.temperature;
 
-    // Resolve reasoning effort: user-configured > default "none" for GPT-5.x sub-models
     const isGPT5SubModel = this.model.modelId.includes("gpt-5.") && !isCodex;
     const userReasoningEffort = this.clientOptions?.reasoningEffort;
-    const resolvedReasoningEffort =
-      userReasoningEffort ?? (isGPT5SubModel ? "none" : undefined);
+    const resolvedReasoningEffort = userReasoningEffort ?? (isGPT5SubModel ? "none" : undefined);
     if (options.response_model) {
       if (isDeepSeek || isKimi) {
-        const parsedSchema = JSON.stringify(
-          toJsonSchema(options.response_model.schema),
-        );
+        const parsedSchema = JSON.stringify(toJsonSchema(options.response_model.schema));
 
         formattedMessages.push({
           role: "user",
@@ -185,9 +177,7 @@ You must respond in JSON format. respond WITH JSON. Do not include any other tex
           providerOptions: resolvedReasoningEffort
             ? {
                 openai: {
-                  ...(isGPT5
-                    ? { textVerbosity: isCodex ? "medium" : "low" }
-                    : {}),
+                  ...(isGPT5 ? { textVerbosity: isCodex ? "medium" : "low" } : {}),
                   reasoningEffort: resolvedReasoningEffort,
                 },
               }
@@ -253,7 +243,6 @@ You must respond in JSON format. respond WITH JSON. Do not include any other tex
               object: objectResponse.object,
               usage: objectResponse.usage,
               finishReason: objectResponse.finishReason,
-              // Omit request and response properties that might contain images
             }),
             type: "object",
           },
@@ -277,40 +266,36 @@ You must respond in JSON format. respond WITH JSON. Do not include any other tex
       }
     }
 
-    const textResponse: Awaited<ReturnType<typeof generateText>> =
-      await generateText({
-        model: this.model,
-        messages: formattedMessages,
-        tools: Object.keys(tools).length > 0 ? tools : undefined,
-        toolChoice:
-          Object.keys(tools).length > 0
-            ? options.tool_choice === "required"
-              ? "required"
-              : options.tool_choice === "none"
-                ? "none"
-                : "auto"
-            : undefined,
-        temperature,
-      });
+    const textResponse: Awaited<ReturnType<typeof generateText>> = await generateText({
+      model: this.model,
+      messages: formattedMessages,
+      tools: Object.keys(tools).length > 0 ? tools : undefined,
+      toolChoice:
+        Object.keys(tools).length > 0
+          ? options.tool_choice === "required"
+            ? "required"
+            : options.tool_choice === "none"
+              ? "none"
+              : "auto"
+          : undefined,
+      temperature,
+    });
 
-    // Transform AI SDK response to match LLMResponse format expected by operator handler.
     type WrappedToolCall = {
       toolCallId?: string;
       toolName: string;
       input: unknown;
     };
-    const transformedToolCalls = (
-      (textResponse.toolCalls || []) as WrappedToolCall[]
-    ).map((toolCall) => ({
-      id:
-        toolCall.toolCallId ||
-        `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      type: "function",
-      function: {
-        name: toolCall.toolName,
-        arguments: JSON.stringify(toolCall.input),
-      },
-    }));
+    const transformedToolCalls = ((textResponse.toolCalls || []) as WrappedToolCall[]).map(
+      (toolCall) => ({
+        id: toolCall.toolCallId || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        type: "function",
+        function: {
+          name: toolCall.toolName,
+          arguments: JSON.stringify(toolCall.input),
+        },
+      }),
+    );
 
     const result = {
       id: `chatcmpl_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -347,7 +332,6 @@ You must respond in JSON format. respond WITH JSON. Do not include any other tex
             text: textResponse.text,
             usage: textResponse.usage,
             finishReason: textResponse.finishReason,
-            // Omit request and response properties that might contain images
           }),
           type: "object",
         },

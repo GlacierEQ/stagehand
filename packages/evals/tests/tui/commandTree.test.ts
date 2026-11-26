@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  buildCommandTree,
   dispatch,
   findChild,
   resolveCommand,
@@ -13,12 +14,7 @@ import { tokenize } from "../../tui/tokenize.js";
 import type { TaskRegistry } from "../../framework/types.js";
 
 type HandlerMock = ReturnType<typeof vi.fn> & CommandHandler;
-type PrintHelpMock = ReturnType<typeof vi.fn> &
-  NonNullable<CommandNode["printHelp"]>;
-
-// ---------------------------------------------------------------------------
-// Fake tree — keeps tests independent of the real handlers.
-// ---------------------------------------------------------------------------
+type PrintHelpMock = ReturnType<typeof vi.fn> & NonNullable<CommandNode["printHelp"]>;
 
 function makeTree(handlers: {
   run: HandlerMock;
@@ -103,44 +99,24 @@ function makeCtx(overrides: Partial<CommandContext> = {}): CommandContext {
   };
 }
 
-// ---------------------------------------------------------------------------
-// tokenize
-// ---------------------------------------------------------------------------
-
 describe("tokenize", () => {
   it("splits on whitespace", () => {
-    expect(tokenize("run act --trials 3")).toEqual([
-      "run",
-      "act",
-      "--trials",
-      "3",
-    ]);
+    expect(tokenize("run act --trials 3")).toEqual(["run", "act", "--trials", "3"]);
   });
 
   it("treats `>` as a separator outside quotes", () => {
     expect(tokenize("experiments > list")).toEqual(["experiments", "list"]);
     expect(tokenize("experiments>list")).toEqual(["experiments", "list"]);
-    expect(tokenize("config > core > path")).toEqual([
-      "config",
-      "core",
-      "path",
-    ]);
+    expect(tokenize("config > core > path")).toEqual(["config", "core", "path"]);
   });
 
   it("collapses runs of `>` and whitespace", () => {
     expect(tokenize("experiments > > list")).toEqual(["experiments", "list"]);
-    expect(tokenize("  experiments   >   list  ")).toEqual([
-      "experiments",
-      "list",
-    ]);
+    expect(tokenize("  experiments   >   list  ")).toEqual(["experiments", "list"]);
   });
 
   it("preserves `>` inside quoted strings", () => {
-    expect(tokenize(`run "foo > bar" --extra`)).toEqual([
-      "run",
-      "foo > bar",
-      "--extra",
-    ]);
+    expect(tokenize(`run "foo > bar" --extra`)).toEqual(["run", "foo > bar", "--extra"]);
     expect(tokenize(`run 'a>b'`)).toEqual(["run", "a>b"]);
   });
 
@@ -151,40 +127,20 @@ describe("tokenize", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// tokenizeArgv
-// ---------------------------------------------------------------------------
-
 describe("tokenizeArgv", () => {
   it("passes through args without `>`", () => {
-    expect(tokenizeArgv(["run", "act", "--trials", "3"])).toEqual([
-      "run",
-      "act",
-      "--trials",
-      "3",
-    ]);
+    expect(tokenizeArgv(["run", "act", "--trials", "3"])).toEqual(["run", "act", "--trials", "3"]);
   });
 
   it("drops standalone `>` tokens", () => {
-    expect(tokenizeArgv(["experiments", ">", "list"])).toEqual([
-      "experiments",
-      "list",
-    ]);
+    expect(tokenizeArgv(["experiments", ">", "list"])).toEqual(["experiments", "list"]);
   });
 
   it("splits args containing `>`", () => {
     expect(tokenizeArgv(["experiments>list"])).toEqual(["experiments", "list"]);
-    expect(tokenizeArgv(["config>core>path"])).toEqual([
-      "config",
-      "core",
-      "path",
-    ]);
+    expect(tokenizeArgv(["config>core>path"])).toEqual(["config", "core", "path"]);
   });
 });
-
-// ---------------------------------------------------------------------------
-// findChild + walkPath
-// ---------------------------------------------------------------------------
 
 describe("findChild + walkPath", () => {
   const tree = makeTree({} as never);
@@ -202,14 +158,16 @@ describe("findChild + walkPath", () => {
   });
 
   it("returns the deepest valid node for partial paths", () => {
-    // "missing" doesn't exist as a child of "config" — bail at config.
     expect(walkPath(tree, ["config", "missing"]).name).toBe("config");
   });
 });
 
-// ---------------------------------------------------------------------------
-// resolveCommand
-// ---------------------------------------------------------------------------
+describe("buildCommandTree", () => {
+  it("exposes verify as a root command", () => {
+    const tree = buildCommandTree();
+    expect(findChild(tree, "verify")?.summary).toBe("Re-score a saved trajectory");
+  });
+});
 
 describe("resolveCommand", () => {
   const tree = makeTree({} as never);
@@ -251,11 +209,7 @@ describe("resolveCommand", () => {
   });
 
   it("strips the `evals` sigil and resolves from root", () => {
-    const r = resolveCommand(
-      tree,
-      ["experiments"],
-      ["evals", "config", "path"],
-    );
+    const r = resolveCommand(tree, ["experiments"], ["evals", "config", "path"]);
     expect(r).toMatchObject({
       kind: "run",
       absolutePath: ["config", "path"],
@@ -270,8 +224,6 @@ describe("resolveCommand", () => {
   });
 
   it("returns unknown when context-only resolution fails", () => {
-    // `config` is a root child but not a child of `experiments` → unknown
-    // at depth, no Pass 2 fallback.
     const r = resolveCommand(tree, ["experiments"], ["config", "path"]);
     expect(r).toMatchObject({
       kind: "unknown",
@@ -286,11 +238,7 @@ describe("resolveCommand", () => {
   });
 
   it("yields remaining args for partial path matches", () => {
-    const r = resolveCommand(
-      tree,
-      [],
-      ["experiments", "compare", "exp1", "exp2"],
-    );
+    const r = resolveCommand(tree, [], ["experiments", "compare", "exp1", "exp2"]);
     expect(r).toMatchObject({
       kind: "run",
       args: ["exp1", "exp2"],
@@ -298,10 +246,6 @@ describe("resolveCommand", () => {
     });
   });
 });
-
-// ---------------------------------------------------------------------------
-// dispatch
-// ---------------------------------------------------------------------------
 
 describe("dispatch", () => {
   function makeHandlers() {
@@ -356,7 +300,6 @@ describe("dispatch", () => {
     const tree = makeTree(h);
     const ctx = makeCtx();
     ctx.setContextPath?.(["experiments"]);
-    // Inside experiments, `evals config` should set context to ["config"].
     await dispatch(tree, ["evals", "config"], ctx);
     expect(ctx.contextPath).toEqual(["config"]);
   });
@@ -395,9 +338,7 @@ describe("dispatch", () => {
     const tree = makeTree(h);
     const ctx = makeCtx();
     ctx.setContextPath?.(["experiments"]);
-    await expect(dispatch(tree, ["nope"], ctx)).rejects.toThrow(
-      /Unknown command "nope"/,
-    );
+    await expect(dispatch(tree, ["nope"], ctx)).rejects.toThrow(/Unknown command "nope"/);
     expect(h.run).not.toHaveBeenCalled();
   });
 
@@ -421,19 +362,15 @@ describe("dispatch", () => {
     const h = makeHandlers();
     const tree = makeTree(h);
     const ctx = makeCtx({ contextPath: null });
-    await expect(dispatch(tree, [".."], ctx)).rejects.toThrow(
-      /not available outside the REPL/,
-    );
+    await expect(dispatch(tree, [".."], ctx)).rejects.toThrow(/not available outside the REPL/);
   });
 
   it("routes `--help` after a leaf to that leaf's printHelp", async () => {
     const h = makeHandlers();
     const tree = makeTree(h);
-    // Add a printHelp to compare for this test.
     const compare = tree.children![2].children![1];
     const printCompareHelp = vi.fn() as PrintHelpMock;
-    (compare as { printHelp?: (s: readonly string[]) => void }).printHelp =
-      printCompareHelp;
+    (compare as { printHelp?: (s: readonly string[]) => void }).printHelp = printCompareHelp;
     await dispatch(tree, ["experiments", "compare", "--help"], makeCtx());
     expect(printCompareHelp).toHaveBeenCalled();
     expect(h.compare).not.toHaveBeenCalled();
@@ -452,5 +389,35 @@ describe("dispatch", () => {
     ctx.setContextPath?.(["experiments"]);
     await dispatch(tree, ["help"], ctx);
     expect(printExperimentsHelp).toHaveBeenCalled();
+  });
+});
+
+describe("real tree: onboarding commands", () => {
+  it("registers `setup` and `welcome` as root leaves with handlers", () => {
+    const tree = buildCommandTree();
+    for (const name of ["setup", "welcome"]) {
+      const node = findChild(tree, name);
+      expect(node?.name).toBe(name);
+      expect(typeof node?.handler).toBe("function");
+      expect(node?.children ?? []).toHaveLength(0);
+    }
+  });
+});
+
+describe("real tree: config path", () => {
+  it("forwards `local` so `config path local` prints the local file path", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const tree = buildCommandTree();
+    await dispatch(
+      tree,
+      tokenizeArgv(["config", "path", "local"]),
+      makeCtx({ entryDir: "/tmp/e" }),
+    );
+    await dispatch(tree, tokenizeArgv(["config", "path"]), makeCtx({ entryDir: "/tmp/e" }));
+    expect(log.mock.calls.map(([line]) => String(line))).toEqual([
+      "/tmp/e/evals.config.local.json",
+      "/tmp/e/evals.config.json",
+    ]);
+    log.mockRestore();
   });
 });

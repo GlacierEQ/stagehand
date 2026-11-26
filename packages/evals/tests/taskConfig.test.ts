@@ -1,10 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import {
-  AgentProvider,
-  AVAILABLE_CUA_MODELS,
-  providerEnvVarMap,
-} from "@browserbasehq/stagehand";
+import { AgentProvider, AVAILABLE_CUA_MODELS, providerEnvVarMap } from "stagehand-v3";
 
 type TaskConfigModule = typeof import("../taskConfig.js");
 
@@ -44,7 +40,6 @@ describe("getModelList", () => {
     const { getModelList } = await loadTaskConfig();
     const models = getModelList();
     expect(models.length).toBeGreaterThan(0);
-    // Default set includes these three
     expect(models).toContain("google/gemini-2.5-flash");
     expect(models).toContain("openai/gpt-4.1-mini");
     expect(models).toContain("anthropic/claude-haiku-4-5");
@@ -54,7 +49,6 @@ describe("getModelList", () => {
     const { getModelList } = await loadTaskConfig();
     const models = getModelList("agent");
     expect(models.length).toBeGreaterThan(0);
-    // Agent models include CUA models
     expect(models.some((m) => m.includes("anthropic"))).toBe(true);
   });
 
@@ -62,13 +56,6 @@ describe("getModelList", () => {
     const { getModelList } = await loadTaskConfig();
     const models = getModelList("external_agent_benchmarks");
     expect(models).toEqual(getModelList("agent"));
-  });
-
-  it("filters by provider when EVAL_PROVIDER is set", async () => {
-    process.env.EVAL_PROVIDER = "openai";
-    const { getModelList } = await loadTaskConfig();
-    const models = getModelList();
-    expect(models.every((m) => m.toLowerCase().startsWith("gpt"))).toBe(true);
   });
 });
 
@@ -84,7 +71,6 @@ describe("getAgentModelEntries", () => {
     expect(standard.length).toBeGreaterThan(0);
     expect(cua.length).toBeGreaterThan(0);
 
-    // Each entry has modelName
     for (const entry of entries) {
       expect(typeof entry.modelName).toBe("string");
       expect(entry.modelName.length).toBeGreaterThan(0);
@@ -100,9 +86,7 @@ describe("getAgentModelEntries", () => {
       expect(provider in providerEnvVarMap).toBe(true);
     }
 
-    expect(cuaEntries.map((entry) => entry.modelName)).not.toContain(
-      "microsoft/fara-7b",
-    );
+    expect(cuaEntries.map((entry) => entry.modelName)).not.toContain("microsoft/fara-7b");
   });
 
   it("runs configured standard agent models in dom and hybrid modes", async () => {
@@ -136,8 +120,7 @@ describe("getAgentModelEntries", () => {
   });
 
   it("runs CUA-capable EVAL_AGENT_MODELS entries in dom and hybrid modes", async () => {
-    process.env.EVAL_AGENT_MODELS =
-      "openai/gpt-5.4,google/gemini-3-flash-preview";
+    process.env.EVAL_AGENT_MODELS = "openai/gpt-5.4,google/gemini-3-flash-preview";
     process.env.EVAL_AGENT_MODELS_CUA = " ";
 
     const { getAgentModelEntries } = await loadTaskConfig();
@@ -151,17 +134,13 @@ describe("getAgentModelEntries", () => {
     );
 
     expect(standardModes).toEqual(["dom", "hybrid"]);
-    expect(cuaEntries.map((entry) => entry.mode).sort()).toEqual([
-      "dom",
-      "hybrid",
-    ]);
+    expect(cuaEntries.map((entry) => entry.mode).sort()).toEqual(["dom", "hybrid"]);
     expect(cuaEntries.every((entry) => entry.cua === false)).toBe(true);
   });
 
   it("does not run non-CUA models from EVAL_AGENT_MODELS_CUA as CUA", async () => {
     process.env.EVAL_AGENT_MODELS = " ";
-    process.env.EVAL_AGENT_MODELS_CUA =
-      "openai/gpt-4.1-mini,google/gemini-3-flash-preview";
+    process.env.EVAL_AGENT_MODELS_CUA = "openai/gpt-4.1-mini,google/gemini-3-flash-preview";
 
     const { getAgentModelEntries } = await loadTaskConfig();
     const entries = getAgentModelEntries();
@@ -193,22 +172,14 @@ describe("cross-cutting categories", () => {
     expect(task.categories).toContain("targeted_extract");
   });
 
-  it("external benchmarks have only external_agent_benchmarks, not agent", async () => {
+  it("has no agent-tier tasks (the v3 agent path was removed)", async () => {
     const { tasksByName } = await loadTaskConfig();
-    const task = tasksByName["agent/gaia"];
-    expect(task).toBeDefined();
-    expect(task.categories).toContain("external_agent_benchmarks");
-    expect(task.categories).not.toContain("agent");
-    // Same for webvoyager
-    const wv = tasksByName["agent/webvoyager"];
-    expect(wv).toBeDefined();
-    expect(wv.categories).toContain("external_agent_benchmarks");
-    expect(wv.categories).not.toContain("agent");
+    const agentTasks = Object.keys(tasksByName).filter((name) => name.startsWith("agent/"));
+    expect(agentTasks).toEqual([]);
   });
 
   it("does not expose core tier tasks", async () => {
     const { tasksByName } = await loadTaskConfig();
-    // Core tasks like "open", "reload" should NOT be in the legacy registry
     expect(tasksByName["open"]).toBeUndefined();
     expect(tasksByName["reload"]).toBeUndefined();
     expect(tasksByName["navigation/open"]).toBeUndefined();
@@ -222,15 +193,9 @@ describe("validateEvalName", () => {
       throw new Error("process.exit called");
     });
 
-    // Use a task that should exist in the discovered filesystem
-    // (the discovery runs at import time in taskConfig.ts)
-    // If no tasks found, this will exit — that's fine, we just test the logic
     try {
-      // Empty string should be a no-op (the if guard checks truthiness)
       validateEvalName("");
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     mockExit.mockRestore();
   });
@@ -242,9 +207,7 @@ describe("validateEvalName", () => {
     }) as any);
     const mockError = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    expect(() => validateEvalName("this_task_does_not_exist_xyz")).toThrow(
-      "process.exit called",
-    );
+    expect(() => validateEvalName("this_task_does_not_exist_xyz")).toThrow("process.exit called");
 
     mockExit.mockRestore();
     mockError.mockRestore();

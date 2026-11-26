@@ -31,7 +31,7 @@ type ParsedArgs = {
 const DEFAULT_PROJECT = "stagehand-core-dev";
 const DEFAULT_TITLE = "Experiment Comparison";
 const PHASE_METRICS = ["startup_ms", "task_ms", "cleanup_ms"] as const;
-const MAX_EXPERIMENTS = 8; // practical layout limit
+const MAX_EXPERIMENTS = 8;
 const SIDE_LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H"];
 
 function defaultOutputPath(): string {
@@ -82,19 +82,13 @@ function parseExperimentSpec(raw: string): ExperimentInput {
   const left = raw.slice(0, eqIdx).trim();
   const right = raw.slice(eqIdx + 1).trim();
   if (!left || !right) {
-    throw new Error(
-      `Invalid experiment spec "${raw}". Use <id> or <label>=<id>.`,
-    );
+    throw new Error(`Invalid experiment spec "${raw}". Use <id> or <label>=<id>.`);
   }
-  // Heuristic: UUIDs, or ids that look like "all-abc123", start with "eval-", etc.
   const looksLikeId = (s: string) =>
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) ||
     /^[a-z][a-z0-9_-]*-[a-f0-9]{4,}$/i.test(s);
-  if (looksLikeId(right) && !looksLikeId(left))
-    return { label: left, experiment: right };
-  if (looksLikeId(left) && !looksLikeId(right))
-    return { label: right, experiment: left };
-  // Default: treat left as id, right as label (common `id=label` form)
+  if (looksLikeId(right) && !looksLikeId(left)) return { label: left, experiment: right };
+  if (looksLikeId(left) && !looksLikeId(right)) return { label: right, experiment: left };
   return { label: right, experiment: left };
 }
 
@@ -135,13 +129,9 @@ function parseArgs(argv: string[]): ParsedArgs {
         const parsed = JSON.parse(raw) as unknown;
         if (
           !Array.isArray(parsed) ||
-          parsed.some(
-            (value) => typeof value !== "string" || value.length === 0,
-          )
+          parsed.some((value) => typeof value !== "string" || value.length === 0)
         ) {
-          throw new Error(
-            "--project-map must be a JSON array of project names",
-          );
+          throw new Error("--project-map must be a JSON array of project names");
         }
         projectMap = parsed;
         break;
@@ -209,17 +199,13 @@ function openInBrowser(filePath: string): void {
   if ((process.env.BROWSER ?? "").toLowerCase() === "none") return;
 
   const platform = process.platform;
-  const command =
-    platform === "darwin" ? "open" : platform === "win32" ? "cmd" : "xdg-open";
-  const args =
-    platform === "win32" ? ["/c", "start", "", filePath] : [filePath];
+  const command = platform === "darwin" ? "open" : platform === "win32" ? "cmd" : "xdg-open";
+  const args = platform === "win32" ? ["/c", "start", "", filePath] : [filePath];
 
   try {
     const child = spawn(command, args, { detached: true, stdio: "ignore" });
     child.unref();
-  } catch {
-    // best-effort
-  }
+  } catch {}
 }
 
 function escapeHtml(value: string): string {
@@ -251,19 +237,11 @@ function formatPct(value: number): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-// ---------------------------------------------------------------------------
-// HTML rendering — N-way comparison, shadcn-inspired
-// ---------------------------------------------------------------------------
-
 function sideLetter(i: number): string {
   return SIDE_LETTERS[i] ?? `#${i + 1}`;
 }
 
-function buildSummary(
-  rows: ExperimentData[],
-  shared: number,
-  sharedTimers: number,
-): string {
+function buildSummary(rows: ExperimentData[], shared: number, sharedTimers: number): string {
   const leader = findLeaderIndex(rows);
 
   const cards = rows
@@ -359,13 +337,10 @@ function buildPhaseBreakdown(rows: ExperimentData[]): string {
 
 function buildTimerGrid(rows: ExperimentData[], keys: string[]): string {
   const timerKeys = keys.filter(
-    (k) =>
-      !PHASE_METRICS.includes(k as (typeof PHASE_METRICS)[number]) &&
-      k !== "total_ms",
+    (k) => !PHASE_METRICS.includes(k as (typeof PHASE_METRICS)[number]) && k !== "total_ms",
   );
   if (timerKeys.length === 0) return "";
 
-  // Sort by spread (max - min across experiments)
   const ordered = [...timerKeys].sort((x, y) => {
     const xs = rows.map((r) => r.taskMetrics[x]?.mean ?? 0);
     const ys = rows.map((r) => r.taskMetrics[y]?.mean ?? 0);
@@ -386,8 +361,7 @@ function buildTimerGrid(rows: ExperimentData[], keys: string[]): string {
           const mean = row.taskMetrics[key]?.mean ?? 0;
           const count = row.taskMetrics[key]?.count ?? 0;
           const height = max > 0 ? (mean / max) * 100 : 0;
-          const isWinner =
-            hasData && mean > 0 && mean === min && rows.length > 1;
+          const isWinner = hasData && mean > 0 && mean === min && rows.length > 1;
           return `
             <div class="timer__col">
               <div class="timer__bar ${isWinner ? "is-winner" : ""}" style="height: ${height.toFixed(2)}%" title="${escapeHtml(row.label)} · ${formatMs(mean)}${count > 1 ? ` · n=${count}` : ""}">
@@ -399,7 +373,6 @@ function buildTimerGrid(rows: ExperimentData[], keys: string[]): string {
         })
         .join("");
 
-      // Best vs worst delta footer
       let footer = "";
       if (hasData && rows.length > 1) {
         const positives = values.filter((v) => v > 0);
@@ -446,9 +419,7 @@ function buildTaskTable(rows: ExperimentData[], taskNames: string[]): string {
   const perRow = taskNames.map((name) => {
     const cells = rows.map((r) => r.tasks.find((t) => t.name === name));
     const anyFail = cells.some((c) => c && !c.success);
-    const timings = cells
-      .map((c) => c?.totalMs)
-      .filter((v): v is number => v !== undefined);
+    const timings = cells.map((c) => c?.totalMs).filter((v): v is number => v !== undefined);
     const minT = timings.length > 0 ? Math.min(...timings) : 0;
     const maxT = timings.length > 0 ? Math.max(...timings) : 0;
     const spread = maxT - minT;
@@ -484,8 +455,7 @@ function buildTaskTable(rows: ExperimentData[], taskNames: string[]): string {
               .map((c) => c.totalMs!),
           );
           const isFastest =
-            cell.totalMs === minT &&
-            r.cells.filter((c) => c?.totalMs !== undefined).length > 1;
+            cell.totalMs === minT && r.cells.filter((c) => c?.totalMs !== undefined).length > 1;
           return `
             <td class="xcol">
               <div class="xcell">
@@ -588,16 +558,9 @@ function agentConfigCell(summary: BenchAgentConfigSummary | undefined): string {
 function buildAgentConfigTable(rows: ExperimentData[]): string {
   const summaries = rows.map(
     (row) =>
-      new Map(
-        summarizeBenchAgentConfigs(row.benchCases).map((summary) => [
-          summary.key,
-          summary,
-        ]),
-      ),
+      new Map(summarizeBenchAgentConfigs(row.benchCases).map((summary) => [summary.key, summary])),
   );
-  const configKeys = [
-    ...new Set(summaries.flatMap((summary) => [...summary.keys()])),
-  ].sort();
+  const configKeys = [...new Set(summaries.flatMap((summary) => [...summary.keys()]))].sort();
   if (configKeys.length === 0) return "";
 
   const headerCells = rows
@@ -612,12 +575,8 @@ function buildAgentConfigTable(rows: ExperimentData[]): string {
         .map((summary) => summary.get(key))
         .filter((summary): summary is BenchAgentConfigSummary => !!summary);
       const label = rowSummaries[0]?.label ?? key;
-      const models = [
-        ...new Set(rowSummaries.flatMap((summary) => summary.models)),
-      ].sort();
-      const cells = summaries
-        .map((summary) => agentConfigCell(summary.get(key)))
-        .join("");
+      const models = [...new Set(rowSummaries.flatMap((summary) => summary.models))].sort();
+      const cells = summaries.map((summary) => agentConfigCell(summary.get(key))).join("");
       return `
         <tr>
           <th class="task"><code>${escapeHtml(label)}</code></th>
@@ -654,17 +613,12 @@ function buildAgentConfigTable(rows: ExperimentData[]): string {
   `;
 }
 
-function formatMetricValue(
-  value: number | null,
-  unit: string,
-  key: string,
-): string {
+function formatMetricValue(value: number | null, unit: string, key: string): string {
   if (value === null) return "—";
   const normalized = `${unit} ${key}`.toLowerCase();
   if (unit === "ratio") return formatPct(value);
   if (normalized.includes("ms")) return formatMs(value);
-  if (unit === "s" || normalized.includes("duration"))
-    return formatSeconds(value);
+  if (unit === "s" || normalized.includes("duration")) return formatSeconds(value);
   if (/(usd|cost|price|dollar|\$)/.test(normalized)) {
     return `$${value.toFixed(value < 1 ? 4 : 2)}`;
   }
@@ -728,12 +682,7 @@ function buildExperimentMetricsTable(rows: ExperimentData[]): string {
 }
 
 function caseLabel(diff: BenchCaseDiff): string {
-  return [
-    diff.dataset ?? diff.suite,
-    diff.taskId ?? diff.taskName,
-    diff.model,
-    diff.agentMode,
-  ]
+  return [diff.dataset ?? diff.suite, diff.taskId ?? diff.taskName, diff.model, diff.agentMode]
     .filter(Boolean)
     .join(" / ");
 }
@@ -774,8 +723,7 @@ function buildBenchDiffTable(
           const glyph = outcome.passed
             ? `<span class="dot dot--ok"></span>`
             : `<span class="dot dot--fail"></span>`;
-          const duration =
-            outcome.durationMs !== null ? formatMs(outcome.durationMs) : "";
+          const duration = outcome.durationMs !== null ? formatMs(outcome.durationMs) : "";
           return `
             <td class="xcol">
               <div class="xcell">
@@ -824,9 +772,7 @@ function buildBenchDiffTable(
 
 function buildBenchContent(rows: ExperimentData[]): string {
   const diffs = benchCaseDiffs(rows);
-  const differingCases = diffs
-    .filter((diff) => diff.differs && !diff.missing)
-    .slice(0, 100);
+  const differingCases = diffs.filter((diff) => diff.differs && !diff.missing).slice(0, 100);
   const missingCases = diffs.filter((diff) => diff.missing).slice(0, 100);
 
   return `
@@ -1502,10 +1448,7 @@ function buildHtml(title: string, rows: ExperimentData[]): string {
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
 
-  const rows = await fetchManyExperimentData(
-    options.project,
-    options.experiments,
-  );
+  const rows = await fetchManyExperimentData(options.project, options.experiments);
 
   const html = buildHtml(options.title, rows);
   const jsonPath = options.outputPath.replace(/\.html?$/i, ".json");

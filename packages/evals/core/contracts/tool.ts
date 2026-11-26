@@ -1,27 +1,20 @@
+import type { ProbeEvidence } from "stagehand-v3";
 import type { EvalLogger } from "../../logger.js";
-import type {
-  ActionTarget,
-  FocusedTarget,
-  TargetKind,
-  WaitSpec,
-} from "./targets.js";
-import type {
-  PageRepresentation,
-  RepresentationOpts,
-} from "./representation.js";
-import type {
-  Artifact,
-  BrowserOwnership,
-  ConnectionMode,
-  EnvironmentName,
-} from "./results.js";
+import type { ActionTarget, FocusedTarget, TargetKind, WaitSpec } from "./targets.js";
+import type { PageRepresentation, RepresentationOpts } from "./representation.js";
+import type { Artifact, BrowserOwnership, ConnectionMode, EnvironmentName } from "./results.js";
 
 export type ToolSurface =
   | "understudy_code"
+  | "stagehand_code"
   | "playwright_code"
   | "cdp_code"
   | "playwright_mcp"
   | "chrome_devtools_mcp"
+  | "google_computer_use"
+  | "anthropic_browser_toolset"
+  | "stagehand_facade"
+  | "stagehand_facade_legacy"
   | "browse_cli";
 
 export type StartupProfile =
@@ -111,16 +104,10 @@ export interface CorePageHandle {
   scroll(x: number, y: number, deltaX: number, deltaY: number): Promise<void>;
 
   type(text: string): Promise<void>;
-  type(
-    target: string | ActionTarget | FocusedTarget,
-    text: string,
-  ): Promise<void>;
+  type(target: string | ActionTarget | FocusedTarget, text: string): Promise<void>;
 
   press(key: string): Promise<void>;
-  press(
-    target: string | ActionTarget | FocusedTarget,
-    key: string,
-  ): Promise<void>;
+  press(target: string | ActionTarget | FocusedTarget, key: string): Promise<void>;
 
   represent?(opts?: RepresentationOpts): Promise<PageRepresentation>;
 }
@@ -151,8 +138,35 @@ export interface ToolStartInput {
   };
 }
 
+export interface BrowserSessionLoss {
+  cause: string;
+  tool?: string;
+  at?: string;
+  provider?: "local" | "browserbase";
+  sessionId?: string;
+  sessionAgeMs?: number;
+  sessionTimeoutMs?: number;
+}
+
+export interface RunnerToolCallResult {
+  content: Array<
+    | { type: "text"; text: string }
+    | { type: "image"; data: string; mimeType: string }
+    | Record<string, unknown>
+  >;
+  isError?: boolean;
+}
+
 export interface ToolStartResult {
   session: CoreSession;
+  agentMount?: AgentMount;
+  captureEvidence?: () => Promise<ProbeEvidence>;
+  callTool?: (
+    name: string,
+    args: Record<string, unknown>,
+    options?: { timeoutMs?: number },
+  ) => Promise<RunnerToolCallResult>;
+  browserSessionLoss?: () => BrowserSessionLoss | undefined;
   cleanup: () => Promise<void>;
   metadata: {
     environment: EnvironmentName;
@@ -165,14 +179,37 @@ export interface ToolStartResult {
 export interface CoreTool {
   id: ToolSurface;
   surface: "code" | "mcp" | "cli";
-  family:
-    | "understudy"
-    | "playwright"
-    | "cdp"
-    | "stagehand_cli"
-    | "chrome_devtools";
+  family: "understudy" | "stagehand" | "playwright" | "cdp" | "stagehand_cli" | "chrome_devtools";
   supportedStartupProfiles: StartupProfile[];
   supportedCapabilities: CoreCapability[];
   supportedTargetKinds: TargetKind[];
   start(input: ToolStartInput): Promise<ToolStartResult>;
 }
+
+export const AGENT_RUN_TOOL_SERVER = "stagehand_browser";
+export const AGENT_RUN_TOOL_NAME = `mcp__${AGENT_RUN_TOOL_SERVER}__run`;
+export const AGENT_RUN_TOOL_RESERVED_HANDLES = ["startUrl", "task", "console"] as const;
+
+export interface AgentRunToolSpec {
+  description: string;
+  codeParamDescription: string;
+  denyMessage: string;
+}
+
+export type AgentMount = { promptInstructions: string } & (
+  | {
+      via: "handles";
+      handles: Record<string, unknown>;
+      runTool: AgentRunToolSpec;
+    }
+  | { via: "mcp"; mcpServers: Record<string, unknown> }
+  | {
+      via: "cli";
+      command: {
+        bin: string;
+        args?: string[];
+        cwd?: string;
+        env?: Record<string, string>;
+      };
+    }
+);

@@ -1,0 +1,147 @@
+python_dir := "packages/sdk-python"
+integrations_python_dir := "packages/integrations/core/python"
+deepagents_python_dir := "packages/integrations/deepagents"
+
+install:
+    pnpm install --frozen-lockfile
+    uv sync --all-packages --locked
+
+generate:
+    pnpm --filter ./packages/protocol build
+    uv --directory {{python_dir}} run --locked python scripts/generate.py
+    uv --directory {{python_dir}} run --locked ty check
+    pnpm --filter ./packages/extension build
+
+check:
+    pnpm exec tsx scripts/release/check-changesets.ts
+    pnpm exec tsx scripts/release/consolidate-changelogs.ts --check
+    pnpm exec tsx scripts/release/sync-python-version.ts --check
+    pnpm check
+    uv lock --check
+    uv --directory {{python_dir}} run --locked python scripts/generate.py --check
+    uv --directory {{python_dir}} run --locked ruff format --check .
+    uv --directory {{python_dir}} run --locked ruff check .
+    uv --directory {{python_dir}} run --locked ty check
+    uv --directory {{integrations_python_dir}} run --locked ruff format --check .
+    uv --directory {{integrations_python_dir}} run --locked ruff check .
+    uv --directory {{integrations_python_dir}} run --locked ty check
+    just check-deepagents
+    pnpm --filter ./packages/extension build
+
+test:
+    pnpm test
+    uv --directory {{python_dir}} run --locked pytest
+    uv --directory {{integrations_python_dir}} run --locked pytest
+    just test-deepagents
+    uv --directory packages/examples/cookbooks/paginated-catalog/python run --locked python -m unittest
+
+docs:
+    pnpm run docs
+
+example name="act":
+    pnpm --filter ./packages/extension build
+    pnpm --filter ./packages/sdk-ts build
+    pnpm exec tsx "packages/sdk-ts/examples/{{name}}.ts"
+
+showcase slug *args:
+    pnpm --filter ./packages/extension build
+    pnpm --filter ./packages/sdk-ts build
+    pnpm --filter ./packages/integrations/core build
+    pnpm exec tsx packages/examples/showcase/_harness/run.ts {{slug}} {{args}}
+
+showcase-script slug:
+    pnpm --filter ./packages/extension build
+    pnpm --filter ./packages/sdk-ts build
+    pnpm exec tsx packages/examples/showcase/{{slug}}/index.ts
+
+cookbook slug:
+    pnpm exec turbo run build --filter=@browserbasehq/stagehand
+    pnpm --dir "packages/examples/cookbooks/{{slug}}/typescript" start
+
+cookbook-python slug:
+    pnpm --filter ./packages/extension build
+    uv --directory "packages/examples/cookbooks/{{slug}}/python" run --locked python main.py
+
+fmt:
+    pnpm fmt
+    uv --directory {{python_dir}} run --locked ruff check --fix .
+    uv --directory {{python_dir}} run --locked ruff format .
+    uv --directory {{integrations_python_dir}} run --locked ruff check --fix .
+    uv --directory {{integrations_python_dir}} run --locked ruff format .
+    just fmt-deepagents
+
+# The adapter and examples use the adapter's Ruff configuration.
+check-deepagents:
+    uv --directory {{deepagents_python_dir}} run --locked ruff format --check src tests examples
+    uv --directory {{deepagents_python_dir}} run --locked ruff check src tests examples
+    PYTHON_DOTENV_DISABLED=1 uv --directory {{deepagents_python_dir}}/examples/local run --project "{{justfile_directory()}}" --package stagehand-deepagents-local-example --locked python -c 'import agent; import agents2'
+    PYTHON_DOTENV_DISABLED=1 uv --directory {{deepagents_python_dir}}/examples/managed run --project "{{justfile_directory()}}" --package stagehand-managed-deep-agent --locked python -c 'import agent'
+
+fmt-deepagents:
+    uv --directory {{deepagents_python_dir}} run --locked ruff check --fix src tests examples
+    uv --directory {{deepagents_python_dir}} run --locked ruff format src tests examples
+
+test-deepagents:
+    uv --directory {{deepagents_python_dir}} run --locked pytest
+    uv --directory {{deepagents_python_dir}}/runner run --project "{{justfile_directory()}}" --package stagehand-deepagents-eval-runner --locked pytest
+
+build-extension:
+    pnpm --filter ./packages/extension build
+
+build:
+    pnpm build
+    uv --directory {{python_dir}} run --locked python scripts/build.py
+    pnpm exec tsx scripts/release/check-extension-build.ts --typescript packages/sdk-ts/dist --wheel {{python_dir}}/dist/*.whl --expect "$(pnpm exec tsx scripts/release/check-extension-build.ts --print-fingerprint)"
+
+changeset:
+    pnpm exec changeset
+
+# Prefixed with `_` because this internal recipe is only used to generate release versions and changelogs.
+_version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+        export GITHUB_TOKEN="$(gh auth token)"
+    fi
+    pnpm exec tsx scripts/release/scoped-release.ts version sdk
+    pnpm exec tsx scripts/release/consolidate-changelogs.ts
+    pnpm exec tsx scripts/release/sync-python-version.ts
+    uv lock
+    just generate
+    pnpm exec tsx scripts/release/sync-python-version.ts --check
+
+# The release workflow reads the validated fingerprint from the last line of output.
+_build-release-extension:
+    pnpm exec tsx scripts/release/scoped-release.ts version sdk --snapshot
+    just build-extension
+    pnpm exec tsx scripts/release/check-extension-build.ts --print-fingerprint
+
+# Python distributions need release tooling. The extension and SDK TS filters are kept
+# until a narrower install can be tried in a release run.
+_install-python-release:
+    pnpm --filter stagehand-workspace --filter '@browserbasehq/stagehand-extension...' --filter '@browserbasehq/stagehand...' install --frozen-lockfile
+    uv sync --package stagehand --locked
+
+_publish-typescript extension_fingerprint:
+    pnpm --filter ./packages/sdk-ts build
+    pnpm exec tsx scripts/release/check-extension-build.ts --typescript packages/sdk-ts/dist --expect {{quote(extension_fingerprint)}}
+    pnpm --filter @browserbasehq/eve build
+    pnpm exec tsx scripts/release/scoped-release.ts publish sdk
+
+# Publishes a commit-addressed alpha of the TypeScript SDK (`<next>-alpha-<sha>`)
+# under the `alpha` dist-tag. Only packages with pending changesets are versioned,
+# so this is a no-op when nothing is unreleased.
+_publish-typescript-alpha extension_fingerprint:
+    pnpm exec tsx scripts/release/scoped-release.ts version sdk --snapshot
+    pnpm --filter ./packages/sdk-ts build
+    pnpm exec tsx scripts/release/check-extension-build.ts --typescript packages/sdk-ts/dist --expect {{quote(extension_fingerprint)}}
+    pnpm exec tsx scripts/release/scoped-release.ts publish sdk --alpha
+
+# Rewrites the Python project to the commit-addressed alpha (`<next>a0.dev<N>`)
+# derived from the changesets snapshot version. Nothing is committed; the
+# working tree is discarded after publishing.
+_version-python-alpha:
+    pnpm exec tsx scripts/release/scoped-release.ts version sdk --snapshot
+    pnpm exec tsx scripts/release/python-alpha-version.ts
+    uv lock
+    uv --directory "{{python_dir}}" run --locked python scripts/generate.py

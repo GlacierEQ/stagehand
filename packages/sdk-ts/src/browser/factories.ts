@@ -1,0 +1,377 @@
+import type { StagehandInitParams } from "@browserbasehq/stagehand-protocol/types";
+import {
+  BrowserbaseConnectOptionsSchema,
+  BrowserbaseFetchOptionsSchema,
+  BrowserbaseLaunchOptionsSchema,
+  BrowserbaseSearchOptionsSchema,
+  LocalBrowserConnectOptionsSchema,
+  LocalBrowserLaunchOptionsSchema,
+} from "../clientSchemas.js";
+import {
+  claimStagehandBrowserHandle,
+  createStagehandBrowserHandle,
+  invalidateStagehandBrowserHandle,
+  isStagehandBrowser,
+  releaseStagehandBrowserHandle,
+  type BrowserbaseBrowser,
+  type LocalBrowser,
+  type StagehandBrowser,
+  type StagehandBrowserOrigin,
+  type StagehandBrowserProvider,
+} from "./index.js";
+import { CDPClient, CDPConnectionClosedError, type CDPClientOptions } from "../cdpClient.js";
+import {
+  createBrowserbaseSessionClient,
+  type BrowserbaseSessionClientFactory,
+} from "./browserbaseSession.js";
+import {
+  createBrowserbaseServicesClient,
+  type BrowserbaseServicesClient,
+} from "./browserbaseServices.js";
+import { launchLocalBrowser, type LocalBrowserLauncher } from "./localBrowser.js";
+import { STAGEHAND_EXTENSION_DIRECTORY_PATH } from "../extensionAssets.js";
+import { abortable } from "../abort.js";
+import { withStagehandInitDeadline } from "../timeouts.js";
+
+export { isStagehandBrowser };
+export type { BrowserbaseBrowser, LocalBrowser, StagehandBrowser } from "./index.js";
+
+export type StagehandWorkerInitMetadata = {
+  browserCdpUrl?: string;
+  apiKey?: string;
+  browser?: StagehandInitParams["browser"];
+};
+
+export type ClaimedStagehandBrowser = {
+  cdpClient: CDPClient;
+  workerInitMetadata: StagehandWorkerInitMetadata;
+};
+
+type BrowserFactoryDependencies = {
+  launchLocalBrowser?: LocalBrowserLauncher;
+  createBrowserbaseSessionClient?: BrowserbaseSessionClientFactory;
+  createBrowserbaseServicesClient?: (apiKey: string, baseUrl: string) => BrowserbaseServicesClient;
+  connectCdp?: (options: CDPClientOptions) => Promise<CDPClient>;
+};
+
+type BrowserConnectionSource = {
+  cdpUrl: string;
+  keepAlive: boolean;
+  close?: () => Promise<void> | void;
+};
+
+function createBrowserFactories(dependencies: BrowserFactoryDependencies = {}): {
+  localBrowser: LocalBrowser;
+  browserbase: BrowserbaseBrowser;
+} {
+  const launchLocal = dependencies.launchLocalBrowser ?? launchLocalBrowser;
+  const createBrowserbase =
+    dependencies.createBrowserbaseSessionClient ?? createBrowserbaseSessionClient;
+  const createBrowserbaseServices =
+    dependencies.createBrowserbaseServicesClient ?? createBrowserbaseServicesClient;
+  const connectCdp = dependencies.connectCdp ?? ((options) => CDPClient.connect(options));
+
+  return {
+    localBrowser: {
+      async launch(input = {}) {
+        const options = LocalBrowserLaunchOptionsSchema.parse(input);
+        if (options.acceptDownloads === true && options.downloadsPath === undefined) {
+          throw new Error("downloadsPath is required when acceptDownloads is true");
+        }
+        return await withStagehandInitDeadline(async (signal) => {
+          const launchPromise = launchLocal(options, signal);
+          let launched: Awaited<typeof launchPromise>;
+          try {
+            launched = await abortable(launchPromise, signal);
+          } catch (error) {
+            if (signal.aborted && options.keepAlive !== true) {
+              void launchPromise.then((lateBrowser) => lateBrowser.close()).catch(() => undefined);
+            }
+            throw error;
+          }
+          const source: BrowserConnectionSource = {
+            cdpUrl: launched.cdpUrl,
+            keepAlive: options.keepAlive ?? false,
+            close: launched.close,
+          };
+          return await connectBrowser({
+            provider: "local",
+            origin: "launched",
+            source,
+            connectCdp,
+            extension: { extensionDir: STAGEHAND_EXTENSION_DIRECTORY_PATH },
+            signal,
+            afterConnect:
+              options.acceptDownloads === undefined && options.downloadsPath === undefined
+                ? undefined
+                : async (cdpClient, commandSignal) => {
+                    await cdpClient.sendCommand(
+                      "Browser.setDownloadBehavior",
+                      {
+                        behavior: options.acceptDownloads === false ? "deny" : "allow",
+                        ...(options.downloadsPath === undefined
+                          ? {}
+                          : { downloadPath: options.downloadsPath }),
+                      },
+                      undefined,
+                      commandSignal,
+                    );
+                  },
+            workerInitMetadata: {},
+          });
+        });
+      },
+
+      async connect(options) {
+        const parsed = LocalBrowserConnectOptionsSchema.parse(options);
+        const source: BrowserConnectionSource = {
+          cdpUrl: parsed.cdpUrl,
+          keepAlive: true,
+        };
+        return await withStagehandInitDeadline(async (signal) =>
+          connectBrowser({
+            provider: "local",
+            origin: "connected",
+            source,
+            connectCdp,
+            extension: { localExtensionDir: STAGEHAND_EXTENSION_DIRECTORY_PATH },
+            signal,
+            headers: parsed.headers,
+            workerInitMetadata: { browserCdpUrl: parsed.extensionCdpUrl },
+          }),
+        );
+      },
+    },
+
+    browserbase: {
+      async launch(input) {
+        const { apiKey, baseUrl, clientOptions, ...sessionOptions } =
+          BrowserbaseLaunchOptionsSchema.parse(input);
+        return await withStagehandInitDeadline(async (signal) => {
+          const sessionPromise = createBrowserbase(apiKey, baseUrl, clientOptions).createSession(
+            sessionOptions,
+          );
+          let session: Awaited<typeof sessionPromise>;
+          try {
+            session = await abortable(sessionPromise, signal);
+          } catch (error) {
+            if (signal.aborted && sessionOptions.keepAlive !== true) {
+              void sessionPromise
+                .then((lateSession) => lateSession.close?.())
+                .catch(() => undefined);
+            }
+            throw error;
+          }
+          const source: BrowserConnectionSource = {
+            cdpUrl: session.cdpUrl,
+            keepAlive: sessionOptions.keepAlive ?? false,
+            close: session.close,
+          };
+          return await connectBrowser({
+            provider: "browserbase",
+            origin: "launched",
+            source,
+            connectCdp,
+            extension: { preloadedExtension: true },
+            signal,
+            workerInitMetadata: {
+              apiKey,
+              browser: {
+                sessionId: session.sessionId,
+                ...(sessionOptions.region === undefined ? {} : { region: sessionOptions.region }),
+              },
+            },
+          });
+        });
+      },
+
+      async connect(input) {
+        const options = BrowserbaseConnectOptionsSchema.parse(input);
+        const client = createBrowserbase(options.apiKey, options.baseUrl, options.clientOptions);
+        if (!client.connectSession) {
+          throw new Error("Browserbase session connection is not supported by this client");
+        }
+        return await withStagehandInitDeadline(async (signal) => {
+          const session = await abortable(client.connectSession!(options.sessionId), signal);
+          const source: BrowserConnectionSource = {
+            cdpUrl: session.cdpUrl,
+            keepAlive: true,
+            close: session.close,
+          };
+          return await connectBrowser({
+            provider: "browserbase",
+            origin: "connected",
+            source,
+            connectCdp,
+            extension: { preloadedExtension: true },
+            signal,
+            workerInitMetadata: {
+              apiKey: options.apiKey,
+              browser: {
+                sessionId: session.sessionId,
+                ...(session.region === undefined ? {} : { region: session.region }),
+              },
+            },
+          });
+        });
+      },
+
+      async search(input) {
+        const { apiKey, baseUrl, ...params } = BrowserbaseSearchOptionsSchema.parse(input);
+        return await createBrowserbaseServices(apiKey, baseUrl).search(params);
+      },
+
+      async fetch(input) {
+        const { apiKey, baseUrl, ...params } = BrowserbaseFetchOptionsSchema.parse(input);
+        return await createBrowserbaseServices(apiKey, baseUrl).fetch(params);
+      },
+    },
+  };
+}
+
+const factories = createBrowserFactories();
+export const localBrowser = factories.localBrowser;
+export const browserbase = factories.browserbase;
+
+export function createBrowserFactoriesForTest(
+  dependencies: BrowserFactoryDependencies,
+): ReturnType<typeof createBrowserFactories> {
+  return createBrowserFactories(dependencies);
+}
+
+export function claimStagehandBrowser(browser: StagehandBrowser): ClaimedStagehandBrowser {
+  return claimStagehandBrowserHandle<ClaimedStagehandBrowser>(browser);
+}
+
+export function releaseStagehandBrowser(browser: StagehandBrowser): void {
+  releaseStagehandBrowserHandle(browser);
+}
+
+export function invalidateStagehandBrowser(browser: StagehandBrowser): Promise<void> {
+  return invalidateStagehandBrowserHandle(browser);
+}
+
+async function connectBrowser(options: {
+  provider: StagehandBrowserProvider;
+  origin: StagehandBrowserOrigin;
+  source: BrowserConnectionSource;
+  connectCdp: (options: CDPClientOptions) => Promise<CDPClient>;
+  extension:
+    | { extensionDir: string }
+    | { localExtensionDir: string }
+    | { preloadedExtension: true };
+  signal: AbortSignal;
+  afterConnect?: (cdpClient: CDPClient, signal: AbortSignal) => Promise<void>;
+  headers?: Record<string, string>;
+  workerInitMetadata: StagehandWorkerInitMetadata;
+}): Promise<StagehandBrowser> {
+  const ownsSource = options.origin === "launched" && !options.source.keepAlive;
+  let cdpClient: CDPClient | undefined;
+  try {
+    const connectionPromise = options.connectCdp({
+      cdpUrl: options.source.cdpUrl,
+      ...(options.headers === undefined ? {} : { headers: options.headers }),
+      ...options.extension,
+      serviceWorkerUrlIncludes: "service-worker.js",
+      clientLifecycle: {
+        closeBrowserOnDisconnect: options.provider === "local" && ownsSource,
+        extensionCdpUrl: options.workerInitMetadata.browserCdpUrl,
+      },
+      signal: options.signal,
+    });
+    try {
+      cdpClient = await abortable(connectionPromise, options.signal);
+    } catch (error) {
+      if (options.signal.aborted) {
+        void connectionPromise.then((lateClient) => lateClient.close()).catch(() => undefined);
+      }
+      throw error;
+    }
+    await options.afterConnect?.(cdpClient, options.signal);
+    const connectedClient = cdpClient;
+    const invalidate = async () => {
+      connectedClient.close();
+      if (ownsSource) {
+        await closeSource(options.source);
+      }
+    };
+    const close = async () => {
+      const errors: unknown[] = [];
+      try {
+        if (options.provider === "local") {
+          const deadline = new AbortController();
+          const timer = setTimeout(() => deadline.abort(), BROWSER_CLOSE_TIMEOUT_MS);
+          try {
+            await connectedClient.sendCommand("Browser.close", {}, undefined, deadline.signal);
+          } catch (error) {
+            if (deadline.signal.aborted) {
+              if (options.origin === "connected") {
+                errors.push(
+                  new Error(`Browser.close did not respond within ${BROWSER_CLOSE_TIMEOUT_MS} ms`),
+                );
+              }
+            } else if (!(error instanceof CDPConnectionClosedError)) {
+              errors.push(error);
+            }
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+        if (options.provider === "browserbase" || options.origin === "launched") {
+          try {
+            await closeSource(options.source);
+          } catch (error) {
+            errors.push(error);
+          }
+        }
+      } finally {
+        connectedClient.close();
+      }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) throw new AggregateError(errors, "Browser close failed");
+    };
+    return createStagehandBrowserHandle({
+      provider: options.provider,
+      origin: options.origin,
+      sessionId: options.workerInitMetadata.browser?.sessionId,
+      cdpUrl: options.provider === "local" ? options.source.cdpUrl : undefined,
+      attachment: {
+        cdpClient: connectedClient,
+        workerInitMetadata: options.workerInitMetadata,
+      } satisfies ClaimedStagehandBrowser,
+      close,
+      invalidate,
+      // Never closes the browser or releases its session. Browserbase still ends a
+      // session without keepAlive once this connection closes. Detaching first disarms
+      // the extension's watchdog; without that acknowledgement the socket stays open,
+      // since closing it would read as a lost client and could shut the browser down.
+      disconnect: async () => {
+        await connectedClient.detachClient();
+        connectedClient.close();
+      },
+      connected: () => !connectedClient.closed,
+      closeWithoutConnection:
+        options.provider === "browserbase" ? () => closeSource(options.source) : undefined,
+    });
+  } catch (error) {
+    cdpClient?.close();
+    if (ownsSource || (options.provider === "browserbase" && options.origin === "launched")) {
+      try {
+        await closeSource(options.source);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "Browser connection failed and browser cleanup also failed",
+          { cause: error },
+        );
+      }
+    }
+    throw error;
+  }
+}
+
+const BROWSER_CLOSE_TIMEOUT_MS = 5_000;
+
+async function closeSource(source: BrowserConnectionSource): Promise<void> {
+  await source.close?.();
+}

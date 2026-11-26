@@ -1,6 +1,6 @@
 import path from "path";
 import type { Testcase, EvalInput, AgentModelEntry } from "../types/evals.js";
-import type { AvailableModel } from "@browserbasehq/stagehand";
+import type { AvailableModel } from "stagehand-v3";
 import { tasksConfig } from "../taskConfig.js";
 import { getPackageRootDir } from "../runtimePaths.js";
 import {
@@ -10,9 +10,7 @@ import {
   normalizeAgentModelEntries,
 } from "../utils.js";
 
-export const buildOnlineMind2WebTestcases = (
-  models: string[] | AgentModelEntry[],
-): Testcase[] => {
+export const buildOnlineMind2WebTestcases = (models: string[] | AgentModelEntry[]): Testcase[] => {
   const mind2webFilePath = path.join(
     getPackageRootDir(),
     "datasets",
@@ -22,7 +20,6 @@ export const buildOnlineMind2WebTestcases = (
 
   const lines = readJsonlFile(mind2webFilePath);
 
-  // Use EVAL_MAX_K if set, otherwise fall back to EVAL_ONLINEMIND2WEB_LIMIT or default to 25
   const maxCases = process.env.EVAL_MAX_K
     ? Number(process.env.EVAL_MAX_K)
     : process.env.EVAL_ONLINEMIND2WEB_LIMIT
@@ -52,7 +49,19 @@ export const buildOnlineMind2WebTestcases = (
   }
 
   const candidates = parseJsonlRows(lines, isMind2WebRow);
-  const rows = applySampling(candidates, sampleCount, maxCases);
+
+  const explicitIds = process.env.EVAL_ONLINEMIND2WEB_IDS
+    ? process.env.EVAL_ONLINEMIND2WEB_IDS.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : null;
+  let rows: Mind2WebRow[];
+  if (explicitIds && explicitIds.length > 0) {
+    const byId = new Map(candidates.map((r) => [r.task_id, r]));
+    rows = explicitIds.map((id) => byId.get(id)).filter((r): r is Mind2WebRow => Boolean(r));
+  } else {
+    rows = applySampling(candidates, sampleCount, maxCases);
+  }
 
   const allTestcases: Testcase[] = [];
   for (const modelEntry of normalizeAgentModelEntries(models)) {
@@ -70,16 +79,11 @@ export const buildOnlineMind2WebTestcases = (
           level: row.level,
         },
       };
-      const taskCategories =
-        tasksConfig.find((t) => t.name === input.name)?.categories || [];
+      const taskCategories = tasksConfig.find((t) => t.name === input.name)?.categories || [];
       allTestcases.push({
         input,
         name: input.name,
-        tags: [
-          modelEntry.modelName,
-          modelEntry.mode,
-          "mind2web", // Simple dataset tag
-        ],
+        tags: [modelEntry.modelName, modelEntry.mode, "mind2web"],
         metadata: {
           model: modelEntry.modelName as AvailableModel,
           test: `${input.name}:${row.task_id}`,

@@ -1,8 +1,27 @@
 {
-  "name": "@browserbasehq/browse-cli",
-  "version": "0.6.0",
-  "description": "Browser automation CLI for AI agents, built on Stagehand",
-  "type": "commonjs",
+  "name": "browse",
+  "version": "0.12.0",
+  "private": false,
+  "description": "Browser automation CLI for AI agents: local Chrome, Browserbase cloud, snapshots, and skills.",
+  "keywords": [
+    "agent",
+    "ai",
+    "ai-agent",
+    "browser-agent",
+    "browser-automation",
+    "cdp",
+    "chrome",
+    "claude-code",
+    "cli",
+    "codex",
+    "cursor",
+    "playwright",
+    "skills"
+  ],
+  "homepage": "https://github.com/browserbase/stagehand/tree/main/packages/cli#readme",
+  "bugs": {
+    "url": "https://github.com/browserbase/stagehand/issues"
+  },
   "license": "MIT",
   "author": "Browserbase <support@browserbase.com>",
   "repository": {
@@ -10,58 +29,130 @@
     "url": "git+https://github.com/browserbase/stagehand.git",
     "directory": "packages/cli"
   },
-  "bugs": {
-    "url": "https://github.com/browserbase/stagehand/issues"
-  },
-  "homepage": "https://github.com/browserbase/stagehand/tree/main/packages/cli#readme",
-  "keywords": [
-    "browser",
-    "automation",
-    "cli",
-    "ai",
-    "agent",
-    "chrome",
-    "cdp",
-    "web-scraping",
-    "testing",
-    "stagehand"
-  ],
-  "engines": {
-    "node": "^20.19.0 || >=22.12.0"
-  },
-  "main": "./dist/index.js",
   "bin": {
-    "browse": "./dist/index.js"
+    "browse": "bin/run.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "oclif.manifest.json",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
-    "build": "tsup",
-    "dev": "tsx src/index.ts",
-    "browse": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit",
-    "eslint": "eslint .",
-    "lint": "cd ../.. && prettier --check packages/cli && cd packages/cli && pnpm run eslint && pnpm run typecheck",
-    "test": "vitest run",
+    "build": "node -e \"const fs = require('fs'); fs.rmSync('dist', { recursive: true, force: true }); fs.rmSync('oclif.manifest.json', { force: true })\" && tsc -p tsconfig.json && pnpm manifest",
+    "build:local-only": "node -e \"const fs = require('fs'); fs.rmSync('dist', { recursive: true, force: true }); fs.rmSync('oclif.manifest.json', { force: true })\" && tsc -p tsconfig.local-only.json && pnpm manifest",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "cli": "pnpm build && node bin/run.js",
+    "oxlint": "pnpm --workspace-root exec oxlint --config oxlint.config.ts packages/cli",
+    "oxlint:fix": "pnpm --workspace-root exec oxlint --config oxlint.config.ts packages/cli --fix",
+    "format": "pnpm --workspace-root exec oxfmt --config .oxfmtrc.json --write packages/cli",
+    "format:check": "pnpm --workspace-root exec oxfmt --config .oxfmtrc.json --check packages/cli",
+    "lint": "pnpm format:check && pnpm oxlint && pnpm check",
+    "manifest": "oclif manifest .",
+    "test": "pnpm build && vitest run",
     "test:cli": "vitest run",
-    "test:watch": "vitest"
+    "test:smoke": "vitest run --config vitest.smoke.config.ts",
+    "test:smoke:package": "node scripts/smoke-package.mjs",
+    "prepublishOnly": "pnpm build"
   },
   "dependencies": {
-    "@browserbasehq/stagehand": "workspace:*",
-    "commander": "^12.0.0",
-    "dotenv": "^16.4.5",
+    "@browserbasehq/sdk": "^2.28.0",
+    "@browserbasehq/stagehand": "4.4.0",
+    "@hpke/core": "^1.9.0",
+    "@hpke/dhkem-x25519": "^1.8.0",
+    "@inquirer/password": "^4.0.23",
+    "@oclif/core": "^4.11.0",
+    "@vercel/detect-agent": "^1.2.3",
+    "archiver": "^8.0.0",
+    "cross-spawn": "catalog:",
+    "dotenv": "^16.5.0",
+    "fastest-levenshtein": "^1.0.16",
+    "http-status-codes": "^2.3.0",
+    "ignore": "^7.0.5",
     "node-html-markdown": "^1.3.0",
-    "pino": "^9.6.0",
-    "pino-pretty": "^13.0.0",
-    "ws": "^8.18.0"
+    "semver": "^7.7.4",
+    "tsx": "^4.20.6",
+    "ws": "^8.18.3",
+    "zod": "catalog:"
   },
   "devDependencies": {
+    "@browserbasehq/sdk-functions": "catalog:",
+    "@types/archiver": "^8.0.0",
+    "@types/cross-spawn": "catalog:",
     "@types/node": "^20.11.30",
-    "@types/ws": "^8.5.13",
-    "devtools-protocol": "^0.0.1464554",
-    "eslint": "^10.0.2",
-    "tsup": "^8.5.1",
-    "tsx": "^4.10.5",
-    "typescript": "5.8.3",
-    "vite": "^7.3.3",
-    "vitest": "^4.1.6"
+    "@types/semver": "^7.7.1",
+    "@types/ws": "^8.18.1",
+    "oclif": "^4.23.1",
+    "typescript": "^5.8.3",
+    "vitest": "catalog:"
+  },
+  "oclif": {
+    "bin": "browse",
+    "commands": "./dist/commands",
+    "dirname": "browse",
+    "helpClass": "./dist/help.js",
+    "hooks": {
+      "command_not_found": "./dist/hooks/command-not-found.js",
+      "finally": "./dist/hooks/finally.js",
+      "init": "./dist/hooks/init.js",
+      "prerun": "./dist/hooks/prerun.js"
+    },
+    "topicSeparator": " ",
+    "topics": {
+      "cloud": {
+        "description": "Manage Browserbase cloud resources and APIs."
+      },
+      "cloud:contexts": {
+        "description": "Manage Browserbase contexts."
+      },
+      "cloud:extensions": {
+        "description": "Manage Browserbase Chrome extensions."
+      },
+      "cloud:projects": {
+        "description": "Manage Browserbase projects."
+      },
+      "cloud:secrets": {
+        "description": "Create, list, retrieve, update, and delete project secrets."
+      },
+      "cloud:sessions": {
+        "description": "Manage Browserbase browser sessions."
+      },
+      "cloud:sessions:downloads": {
+        "description": "Download Browserbase session artifacts."
+      },
+      "cloud:sessions:uploads": {
+        "description": "Upload files to Browserbase sessions."
+      },
+      "functions": {
+        "description": "Develop, publish, and invoke Browserbase Functions."
+      },
+      "functions:secrets": {
+        "description": "List, attach, and detach project secrets for functions."
+      },
+      "mouse": {
+        "description": "Send raw mouse coordinate input."
+      },
+      "network": {
+        "description": "Capture browser network traffic for the active session."
+      },
+      "skills": {
+        "description": "Discover and install browser automation skills."
+      },
+      "tab": {
+        "description": "Manage browser tabs in the active session."
+      },
+      "templates": {
+        "description": "Browse and scaffold Browserbase templates."
+      }
+    }
+  },
+  "engines": {
+    "node": ">=22.18.0"
   }
 }

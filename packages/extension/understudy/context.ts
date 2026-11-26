@@ -1,0 +1,1116 @@
+import type { Protocol } from "devtools-protocol";
+import type { StagehandLogger } from "../logger.js";
+import { CdpConnection } from "./cdp.js";
+import type { CDPSessionLike, CdpSession, CdpWebSocketFactory } from "./cdp.js";
+import { Page } from "./page.js";
+import { SessionNetworkCapture } from "./sessionNetworkCapture.js";
+import { executionContexts } from "./executionContextRegistry.js";
+import type {
+  Cookie,
+  CookieParam,
+  DomainPolicy,
+  LocalBrowserLaunchOptions,
+} from "@browserbasehq/stagehand-protocol/types";
+import { InitScriptSource } from "../types/private/index.js";
+import { normalizeInitScriptSource } from "./initScripts.js";
+import { ContextClipboard } from "./clipboard.js";
+import { TimeoutError } from "../errors.js";
+import {
+  filterCookies,
+  normalizeCookieParams,
+  cookieMatchesFilter,
+  toCdpCookieParam,
+} from "./cookies.js";
+import type { UnderstudyClearCookieOptions } from "./cookies.js";
+import { getDomainPolicyDecision, normalizeDomainPolicy } from "./domainPolicy.js";
+import type { NormalizedDomainPolicy } from "./domainPolicy.js";
+import type { DomainPolicyRuleSession } from "./domainPolicyDnr.js";
+import type { ChromeTabTargetController } from "./chromeTabs.js";
+import { CLIENT_TARGET_URL } from "../clientLifecycle.js";
+
+type TargetId = string;
+type SessionId = string;
+
+type TargetType = string;
+
+function isMissingTargetError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /No target with given id found/i.test(message);
+}
+
+function hasInjectableDOM(url: string | undefined): boolean {
+  if (!url || url === "") return true;
+  if (url === "about:blank" || url === "about:srcdoc" || url.startsWith("about:blank#"))
+    return true;
+  if (url.startsWith("http://") || url.startsWith("https://")) return true;
+  if (
+    url.startsWith("data:") ||
+    url.startsWith("blob:") ||
+    url.startsWith("file://") ||
+    url.startsWith("filesystem:")
+  )
+    return true;
+  return false;
+}
+
+function isNonWebTarget(info: Protocol.Target.TargetInfo): boolean {
+  if (info.url === CLIENT_TARGET_URL) return true;
+  if (info.type === "page") return false;
+  return info.type !== "iframe" || !hasInjectableDOM(info.url);
+}
+
+function isTopLevelPage(info: Protocol.Target.TargetInfo): boolean {
+  const ti = info as unknown as { subtype?: string };
+  return info.type === "page" && ti.subtype !== "iframe" && info.url !== CLIENT_TARGET_URL;
+}
+
+const DEFAULT_ACTIVE_PAGE_TIMEOUT_MS = 3000;
+
+export class BrowserContext {
+  constructor(
+    readonly conn: CdpConnection,
+    readonly logger: StagehandLogger,
+    readonly chromeTabs: ChromeTabTargetController,
+    readonly env: "LOCAL" | "BROWSERBASE" = "LOCAL",
+    readonly localBrowserLaunchOptions: LocalBrowserLaunchOptions | null = null,
+    readonly blankPageUrl: string = "about:blank",
+    readonly fallbackLocatorScriptSource: string | null = null,
+    private readonly domainPolicyRules?: DomainPolicyRuleSession,
+  ) {}
+
+  readonly _targetSessionListeners = new Set<SessionId>();
+  readonly _sessionInit = new Set<SessionId>();
+  pagesByTarget = new Map<TargetId, Page>();
+  mainFrameToTarget = new Map<string, TargetId>();
+  sessionOwnerPage = new Map<SessionId, Page>();
+  frameOwnerPage = new Map<string, Page>();
+  private readonly pendingNetworkCaptures = new Map<
+    SessionId,
+    { targetId: TargetId; capture: SessionNetworkCapture }
+  >();
+  pendingOopifByMainFrame = new Map<string, SessionId>();
+  pendingOopifParentByMainFrame = new Map<string, string>();
+  adoptedOopifSessionByFrame = new Map<string, SessionId>();
+  createdAtByTarget = new Map<TargetId, number>();
+  typeByTarget = new Map<TargetId, TargetType>();
+  pendingCreatedTargetUrl = new Map<TargetId, string>();
+  pageCreationFailures = new Map<TargetId, Error>();
+  pendingInitialTopLevelTargets = new Set<TargetId>();
+  pendingNewPageTargets = new Set<TargetId>();
+  // Popup close attempts can race targetCreated, targetInfoChanged, and attached.
+  // In-flight promises let attach wait for a close result before deciding whether
+  // to skip normal setup. Successful closes stay deduped for the context lifetime
+  // because Chrome can emit late targetInfoChanged events after targetDestroyed.
+  // Failed closes are not retained so attach can continue and future events may retry.
+  domainPolicyClosingTargets = new Set<TargetId>();
+  domainPolicyClosePromises = new Map<TargetId, Promise<boolean>>();
+  readonly initScripts: string[] = [];
+  extraHttpHeaders: Record<string, string> | null = null;
+  domainPolicy: NormalizedDomainPolicy | null = null;
+  private domainPolicyTail: Promise<void> = Promise.resolve();
+  private closing = false;
+  private closePromise?: Promise<void>;
+  _clipboard?: ContextClipboard;
+
+  get connected(): boolean {
+    return this.conn.connected;
+  }
+
+  async runWithTelemetryContext<Result>(
+    scope: symbol,
+    logger: StagehandLogger,
+    run: () => Result | Promise<Result>,
+  ): Promise<Result> {
+    return await this.conn.runWithTelemetryContext(scope, logger, run);
+  }
+
+  installTargetSessionListeners(session: CDPSessionLike): void {
+    const sessionId = session.id;
+    if (!sessionId) return;
+    if (this._targetSessionListeners.has(sessionId)) return;
+    this._targetSessionListeners.add(sessionId);
+
+    session.on<Protocol.Target.AttachedToTargetEvent>("Target.attachedToTarget", (evt) => {
+      void this.onAttachedToTarget(evt.targetInfo, evt.sessionId);
+    });
+    session.on<Protocol.Target.DetachedFromTargetEvent>("Target.detachedFromTarget", (evt) => {
+      this.onDetachedFromTarget(evt.sessionId, evt.targetId ?? null);
+    });
+    session.on<Protocol.Target.TargetDestroyedEvent>("Target.targetDestroyed", (evt) => {
+      this.cleanupByTarget(evt.targetId);
+    });
+  }
+
+  static async create(
+    wsUrl: string,
+    opts: {
+      websocketFactory: CdpWebSocketFactory;
+      env?: "LOCAL" | "BROWSERBASE";
+      localBrowserLaunchOptions?: LocalBrowserLaunchOptions | null;
+      blankPageUrl: string;
+      fallbackLocatorScriptSource: string;
+      chromeTabs: ChromeTabTargetController;
+      domainPolicyRules?: DomainPolicyRuleSession;
+      logger: StagehandLogger;
+      bootstrapLogger?: StagehandLogger;
+    },
+  ): Promise<BrowserContext> {
+    const connectTask = async () => {
+      const conn = await CdpConnection.connect(wsUrl, opts.websocketFactory, opts.logger);
+      const ctx = new BrowserContext(
+        conn,
+        opts.logger,
+        opts.chromeTabs,
+        opts?.env ?? "LOCAL",
+        opts?.localBrowserLaunchOptions ?? null,
+        opts.blankPageUrl,
+        opts.fallbackLocatorScriptSource,
+        opts.domainPolicyRules,
+      );
+      const bootstrap = async () => {
+        await ctx.bootstrap();
+        if (!ctx.hasTopLevelPage()) {
+          await ctx.newPage();
+        }
+      };
+      try {
+        if (opts.bootstrapLogger) {
+          await conn.runWithTelemetryContext(
+            Symbol("browser.bootstrap"),
+            opts.bootstrapLogger,
+            bootstrap,
+          );
+        } else {
+          await bootstrap();
+        }
+      } catch (error) {
+        try {
+          await ctx.close();
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            "Browser context initialization and cleanup failed",
+          );
+        }
+        throw error;
+      }
+      return ctx;
+    };
+
+    return await connectTask();
+  }
+
+  hasTopLevelPage(): boolean {
+    for (const [targetId, targetType] of this.typeByTarget) {
+      if (targetType === "page" && this.pagesByTarget.has(targetId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  async waitForInitialTopLevelTargets(targetIds: TargetId[]): Promise<void> {
+    if (!targetIds.length) return;
+    const pending = new Set(targetIds);
+    for (const targetId of targetIds) this.pendingInitialTopLevelTargets.add(targetId);
+    try {
+      while (pending.size) {
+        if (!this.conn.connected) {
+          throw new Error(
+            `CDP connection closed while waiting for initial top-level targets: ${Array.from(
+              pending,
+            ).join(", ")}`,
+          );
+        }
+        for (const tid of Array.from(pending)) {
+          if (this.pagesByTarget.has(tid) || this.pageCreationFailures.has(tid)) {
+            this.pageCreationFailures.delete(tid);
+            pending.delete(tid);
+          }
+        }
+        if (!pending.size) return;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    } finally {
+      for (const targetId of targetIds) this.pendingInitialTopLevelTargets.delete(targetId);
+    }
+  }
+
+  public async activePage(): Promise<Page | undefined> {
+    const deadline = Date.now() + DEFAULT_ACTIVE_PAGE_TIMEOUT_MS;
+    let targetId: string | undefined;
+
+    while (Date.now() < deadline) {
+      targetId = await this.chromeTabs.activeTargetId();
+      if (targetId === undefined) return undefined;
+
+      const page = this.pagesByTarget.get(targetId);
+      if (page) return page;
+
+      // Chrome can activate a popup before its auto-attached target has
+      // completed Page creation and registration in pagesByTarget.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    throw new TimeoutError(
+      `activePage: active target not registered (${targetId ?? "unknown"})`,
+      DEFAULT_ACTIVE_PAGE_TIMEOUT_MS,
+    );
+  }
+
+  public async setActivePage(page: Page): Promise<void> {
+    let targetId = page.targetId();
+    if (this.pagesByTarget.get(targetId) !== page) {
+      const lookup = this.findTargetIdByPage(page);
+      if (!lookup) {
+        throw new Error(`Cannot activate unknown Stagehand page "${targetId}"`);
+      }
+      targetId = lookup;
+    }
+
+    await this.chromeTabs.activateTarget(targetId);
+  }
+
+  public async addInitScript<Arg>(script: InitScriptSource<Arg>, arg?: Arg): Promise<void> {
+    const source = await normalizeInitScriptSource(script, arg);
+    if (this.initScripts.includes(source)) return;
+    this.initScripts.push(source);
+    const pages = this.pages();
+    await Promise.all(pages.map((page) => page.registerInitScript(source)));
+  }
+
+  public async setExtraHTTPHeaders(headers: Record<string, string>): Promise<void> {
+    const nextHeaders = { ...headers };
+    this.extraHttpHeaders = nextHeaders;
+
+    const sessions: CDPSessionLike[] = [];
+    for (const sessionId of this._sessionInit) {
+      const session = this.conn.getSession(sessionId);
+      if (session) sessions.push(session);
+    }
+
+    if (!sessions.length) return;
+
+    const results = await Promise.allSettled(
+      sessions.map(async (session) => {
+        await session.send("Network.enable");
+        await session.send("Network.setExtraHTTPHeaders", {
+          headers: nextHeaders,
+        });
+      }),
+    );
+
+    const failures = results
+      .map((result, index) => ({ result, session: sessions[index] }))
+      .filter(
+        (
+          entry,
+        ): entry is {
+          result: PromiseRejectedResult;
+          session: CDPSessionLike;
+        } => entry.result.status === "rejected",
+      )
+      .map((entry) => {
+        const reason: unknown = entry.result.reason;
+        const sid = entry.session.id ?? "unknown";
+        const message = reason instanceof Error ? reason.message : String(reason);
+        return { reason, sessionId: sid, message };
+      });
+
+    if (failures.length) {
+      this.logger.error("setExtraHTTPHeaders failed for one or more sessions", {
+        category: "ctx",
+        failures: failures.map(({ sessionId, message }) => ({ sessionId, message })),
+      });
+      throw failures[0]!.reason;
+    }
+  }
+
+  public getDomainPolicy(): DomainPolicy | null {
+    if (!this.domainPolicy) return null;
+    return {
+      ...(this.domainPolicy.allowedDomains.length
+        ? { allowedDomains: [...this.domainPolicy.allowedDomains] }
+        : {}),
+      ...(this.domainPolicy.blockedDomains.length
+        ? { blockedDomains: [...this.domainPolicy.blockedDomains] }
+        : {}),
+    };
+  }
+
+  public async setDomainPolicy(policy: DomainPolicy | null): Promise<void> {
+    const nextPolicy = normalizeDomainPolicy(policy);
+    if (this.closing) throw new Error("Browser context is closing");
+    const rules = this.domainPolicyRules;
+    if (!rules) throw new Error("Domain policy DNR enforcement is unavailable");
+
+    const update = this.domainPolicyTail.then(async () => {
+      if (this.closing) throw new Error("Browser context is closing");
+      await rules.replace(nextPolicy);
+      this.domainPolicy = nextPolicy;
+    });
+    this.domainPolicyTail = update.catch(() => undefined);
+    await update;
+  }
+
+  public get clipboard(): ContextClipboard {
+    return (this._clipboard ??= new ContextClipboard({
+      context: this,
+      resolvePage: async (page) => {
+        if (page) return page;
+        const active = await this.activePage();
+        if (!active) throw new Error("No Page found for active page");
+        return active;
+      },
+    }));
+  }
+
+  pages(): Page[] {
+    const rows: Array<{ tid: TargetId; page: Page; created: number }> = [];
+    for (const [tid, page] of this.pagesByTarget) {
+      if (this.typeByTarget.get(tid) === "page") {
+        rows.push({ tid, page, created: this.createdAtByTarget.get(tid) ?? 0 });
+      }
+    }
+    rows.sort((a, b) => a.created - b.created);
+    return rows.map((r) => r.page);
+  }
+
+  async applyInitScriptsToPage(page: Page, opts?: { seedOnly?: boolean }): Promise<void> {
+    if (opts?.seedOnly) {
+      for (const source of this.initScripts) {
+        page.seedInitScript(source);
+      }
+      return;
+    }
+    for (const source of this.initScripts) {
+      await page.registerInitScript(source);
+    }
+  }
+
+  resolvePageByMainFrameId(frameId: string): Page | undefined {
+    const targetId = this.mainFrameToTarget.get(frameId);
+    return targetId ? this.pagesByTarget.get(targetId) : undefined;
+  }
+
+  async getFullFrameTreeByMainFrameId(rootMainFrameId: string): Promise<Protocol.Page.FrameTree> {
+    const owner = this.resolvePageByMainFrameId(rootMainFrameId);
+    if (!owner) throw new Error(`No Page found for mainFrameId=${rootMainFrameId}`);
+    return owner.asProtocolFrameTree(rootMainFrameId);
+  }
+
+  public async newPage(url?: string): Promise<Page> {
+    const targetUrl = url === undefined ? this.blankPageUrl : String(url);
+    const { targetId } = await this.conn.send<{ targetId: string }>("Target.createTarget", {
+      url: this.blankPageUrl,
+    });
+    this.pendingCreatedTargetUrl.set(targetId, this.blankPageUrl);
+    this.pendingNewPageTargets.add(targetId);
+    await this.conn.send("Target.activateTarget", { targetId }).catch(() => {});
+
+    try {
+      while (this.conn.connected) {
+        const failure = this.pageCreationFailures.get(targetId);
+        if (failure) throw failure;
+
+        const page = this.pagesByTarget.get(targetId);
+        if (page) {
+          await page.mainFrameWrapper.getExtensionWorldExecutionContextId();
+          if (url !== undefined) {
+            await page.goto(targetUrl);
+            if (targetUrl.startsWith("http://") || targetUrl.startsWith("https://")) {
+              await page.mainFrameWrapper.getExtensionWorldExecutionContextId();
+            }
+          }
+          return page;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      throw new Error(`CDP connection closed before newPage target attached (${targetId})`);
+    } finally {
+      this.pendingNewPageTargets.delete(targetId);
+      this.pendingCreatedTargetUrl.delete(targetId);
+      this.pageCreationFailures.delete(targetId);
+    }
+  }
+
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    for (const { capture } of this.pendingNetworkCaptures.values()) capture.dispose();
+    this.pendingNetworkCaptures.clear();
+    const closing = Promise.resolve().then(async () => {
+      try {
+        await this.conn.close();
+      } finally {
+        await this.domainPolicyTail;
+        try {
+          await this.domainPolicyRules?.close();
+          this.domainPolicy = null;
+        } finally {
+          this.pagesByTarget.clear();
+          this.mainFrameToTarget.clear();
+          this.sessionOwnerPage.clear();
+          this.frameOwnerPage.clear();
+          this.pendingOopifByMainFrame.clear();
+          this.pendingOopifParentByMainFrame.clear();
+          this.adoptedOopifSessionByFrame.clear();
+          this.createdAtByTarget.clear();
+          this.typeByTarget.clear();
+          this.pendingCreatedTargetUrl.clear();
+          this.pageCreationFailures.clear();
+          this.pendingInitialTopLevelTargets.clear();
+          this.pendingNewPageTargets.clear();
+          this.domainPolicyClosingTargets.clear();
+          this.domainPolicyClosePromises.clear();
+          this._sessionInit.clear();
+        }
+      }
+    });
+    this.closePromise = closing.catch((error) => {
+      this.closePromise = undefined;
+      throw error;
+    });
+    return this.closePromise;
+  }
+
+  async bootstrap(): Promise<void> {
+    this.conn.on<Protocol.Target.AttachedToTargetEvent>("Target.attachedToTarget", async (evt) => {
+      await this.onAttachedToTarget(evt.targetInfo, evt.sessionId);
+    });
+
+    this.conn.on<Protocol.Target.DetachedFromTargetEvent>("Target.detachedFromTarget", (evt) => {
+      this.onDetachedFromTarget(evt.sessionId, evt.targetId ?? null);
+    });
+
+    this.conn.on<Protocol.Target.TargetDestroyedEvent>("Target.targetDestroyed", (evt) => {
+      this.cleanupByTarget(evt.targetId);
+    });
+
+    this.conn.on<Protocol.Target.TargetCreatedEvent>("Target.targetCreated", (evt) => {
+      const info = evt.targetInfo;
+      if (info.type === "page" && (info.openerId || info.openerFrameId)) {
+        void this.closePopupIfBlockedByDomainPolicy(info, "targetCreated");
+      }
+    });
+    this.conn.on<Protocol.Target.TargetInfoChangedEvent>("Target.targetInfoChanged", (evt) => {
+      void this.closePopupIfBlockedByDomainPolicy(evt.targetInfo, "targetInfoChanged");
+    });
+
+    // Register the targets that bootstrap must account for before enabling
+    // auto-attach. Chrome can replay, detach, or destroy an existing target as
+    // part of Target.setAutoAttach; those terminal events must remain visible to
+    // the waiter below instead of being discarded before the target is pending.
+    const targets = await this.conn.getTargets();
+    const topLevelTargetIds = targets.filter((t) => isTopLevelPage(t)).map((t) => t.targetId);
+    for (const targetId of topLevelTargetIds) this.pendingInitialTopLevelTargets.add(targetId);
+
+    await this.conn.enableAutoAttach();
+
+    const targetsAfterAutoAttach = new Map(
+      (await this.conn.getTargets()).map((target) => [target.targetId, target]),
+    );
+    for (const t of targets) {
+      const currentTarget = targetsAfterAutoAttach.get(t.targetId);
+      if (!currentTarget) {
+        this.recordPageCreationFailure(
+          t.targetId,
+          new Error(`Initial target disappeared before attachment (${t.targetId})`),
+          "Initial target disappeared before attachment",
+        );
+        continue;
+      }
+      if (currentTarget.attached) continue;
+      try {
+        await this.conn.attachToTarget(t.targetId);
+      } catch (error) {
+        this.recordPageCreationFailure(t.targetId, error, "Failed to attach initial target");
+      }
+    }
+
+    await this.waitForInitialTopLevelTargets(topLevelTargetIds);
+  }
+
+  async onAttachedToTarget(info: Protocol.Target.TargetInfo, sessionId: SessionId): Promise<void> {
+    if ((await this.closePopupIfBlockedByDomainPolicy(info, "attached")) || this.closing) {
+      return;
+    }
+
+    // Skip non-web targets (workers, chrome extensions, background pages, etc.).
+    // They still need to be resumed so we don't leave them paused by
+    // waitForDebuggerOnStart. Trying to initialize these targets can throw or
+    // corrupt their internal state (e.g. Chrome's PDF viewer).
+    if (isNonWebTarget(info)) {
+      const session = this.conn.getSession(sessionId);
+      if (session) {
+        await session.send("Runtime.runIfWaitingForDebugger").catch(() => {});
+      }
+      return;
+    }
+
+    const session = this.conn.getSession(sessionId);
+    if (!session) return;
+
+    if (this._sessionInit.has(sessionId)) return;
+    this._sessionInit.add(sessionId);
+
+    this.installTargetSessionListeners(session);
+
+    // Register for Runtime events before enabling it so we don't miss initial contexts.
+    if (this.fallbackLocatorScriptSource) {
+      executionContexts.setFallbackInstallerSource(session, this.fallbackLocatorScriptSource);
+    }
+    executionContexts.attachSession(session);
+
+    let resumed = false;
+    const resume = async (): Promise<void> => {
+      if (resumed) return;
+      resumed = true;
+      // waitForDebuggerOnStart pauses new targets; resume once we've done
+      // any "must happen before first document" work.
+      await session.send("Runtime.runIfWaitingForDebugger").catch(() => {});
+    };
+
+    const networkCapture = isTopLevelPage(info) ? undefined : new SessionNetworkCapture(session);
+    if (networkCapture) {
+      this.pendingNetworkCaptures.set(sessionId, {
+        targetId: info.targetId,
+        capture: networkCapture,
+      });
+    }
+
+    // Attach lifecycle (per target session):
+    // 1) while paused, enable domains + child auto-attach and register init scripts;
+    // 2) resume target execution;
+    // 3) build/adopt Page ownership and frame bridges.
+    // Some CDP backends defer *.enable() responses until after resume, so we
+    // cannot await those responses before resuming. Instead we:
+    // - wait for transport-level dispatch of required pre-resume commands;
+    // - then dispatch resume;
+    // - then await responses.
+    const queuePreResume = (
+      method: string,
+      params?: object,
+      match?: (sentParams?: object) => boolean,
+    ) => {
+      const dispatched = this.conn
+        .waitForSessionDispatch(sessionId, method, match)
+        .then(() => true)
+        .catch(() => false);
+      const response = session
+        .send(method, params)
+        .then(() => true)
+        .catch(() => false);
+      return { dispatched, response };
+    };
+    const initScriptOps: Array<{
+      dispatched: Promise<boolean>;
+      response: Promise<boolean>;
+    }> = [];
+    const corePreResumeOps = [
+      ...(networkCapture ? [queuePreResume("Network.enable")] : []),
+      queuePreResume("Page.enable"),
+      queuePreResume("Runtime.enable"),
+      queuePreResume("Target.setAutoAttach", {
+        autoAttach: true,
+        waitForDebuggerOnStart: true,
+        flatten: true,
+      }),
+    ];
+    const headerPreResumeOps: Array<{
+      dispatched: Promise<boolean>;
+      response: Promise<boolean>;
+    }> = [];
+    if (this.extraHttpHeaders) {
+      const headers = { ...this.extraHttpHeaders };
+      if (!networkCapture) headerPreResumeOps.push(queuePreResume("Network.enable"));
+      headerPreResumeOps.push(queuePreResume("Network.setExtraHTTPHeaders", { headers }));
+    }
+    if (this.initScripts.length) {
+      for (const source of this.initScripts) {
+        initScriptOps.push(
+          queuePreResume(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+              source,
+              runImmediately: true,
+            },
+            (sentParams) => (sentParams as { source?: string } | undefined)?.source === source,
+          ),
+        );
+      }
+    }
+    const preResumeDispatched = (
+      await Promise.all([
+        ...corePreResumeOps.map((op) => op.dispatched),
+        ...headerPreResumeOps.map((op) => op.dispatched),
+        ...initScriptOps.map((op) => op.dispatched),
+      ])
+    ).every(Boolean);
+    const resumeOp = queuePreResume("Runtime.runIfWaitingForDebugger");
+    const [resumedDispatched, resumedOk] = await Promise.all([
+      resumeOp.dispatched,
+      resumeOp.response,
+    ]);
+    const [coreResults, headerResults, initScriptResults] = await Promise.all([
+      Promise.all(corePreResumeOps.map((op) => op.response)),
+      Promise.all(headerPreResumeOps.map((op) => op.response)),
+      Promise.all(initScriptOps.map((op) => op.response)),
+    ]);
+    void headerResults;
+    if (!preResumeDispatched || !resumedDispatched || !resumedOk) {
+      this.disposePendingNetworkCapture(sessionId);
+      if (isTopLevelPage(info)) {
+        this.recordPageCreationFailure(
+          info.targetId,
+          new Error("Failed target pre-resume setup ordering"),
+          "Failed target pre-resume setup ordering",
+        );
+        this.logger.debug("Failed target pre-resume setup ordering", {
+          category: "ctx",
+          targetId: String(info.targetId),
+          targetType: String(info.type),
+          preResumeDispatched,
+          resumedDispatched,
+          resumedOk,
+        });
+      }
+      return;
+    }
+    resumed = true;
+
+    const scriptsInstalled = coreResults.every(Boolean) && initScriptResults.every(Boolean);
+
+    try {
+      void session.send("Page.setLifecycleEventsEnabled", { enabled: true }).catch(() => {});
+
+      if (isTopLevelPage(info)) {
+        let page: Page | null = null;
+        let createError: unknown;
+        try {
+          page = await Page.create(
+            this.conn,
+            session,
+            info.targetId,
+            this.logger,
+            this.localBrowserLaunchOptions,
+            this.env === "BROWSERBASE",
+          );
+        } catch (error) {
+          createError = error;
+        }
+        if (!page) {
+          this.recordPageCreationFailure(
+            info.targetId,
+            createError,
+            "Failed to create top-level page",
+          );
+          this.logger.debug("Failed to create top-level page", {
+            category: "ctx",
+            targetId: String(info.targetId),
+            targetType: String(info.type),
+            targetUrl: String(info.url ?? ""),
+            error: String(createError instanceof Error ? createError.message : createError),
+          });
+          return;
+        }
+        this.wireSessionToOwnerPage(sessionId, page);
+        this.pagesByTarget.set(info.targetId, page);
+        this.mainFrameToTarget.set(page.mainFrameId(), info.targetId);
+        this.sessionOwnerPage.set(sessionId, page);
+        this.frameOwnerPage.set(page.mainFrameId(), page);
+        this.typeByTarget.set(info.targetId, "page");
+        if (!this.createdAtByTarget.has(info.targetId)) {
+          this.createdAtByTarget.set(info.targetId, Date.now());
+        }
+        const pendingSeedUrl = this.pendingCreatedTargetUrl.get(info.targetId);
+        this.pendingCreatedTargetUrl.delete(info.targetId);
+        page.seedCurrentUrl(pendingSeedUrl ?? info.url ?? "");
+        this.installFrameEventBridges(sessionId, page);
+        this.adoptPendingOopifsByParent();
+        await this.applyInitScriptsToPage(page, {
+          seedOnly: scriptsInstalled,
+        });
+        return;
+      }
+
+      try {
+        const { frameTree } =
+          await session.send<Protocol.Page.GetFrameTreeResponse>("Page.getFrameTree");
+        if (this.closing || this.conn.getSession(sessionId) !== session) return;
+        const childMainId = frameTree.frame.id;
+
+        // Remote frames are missing from the parent's frame tree, so fall back to the
+        // page that owns the parent frame (pre-existing or nested OOPIFs).
+        const parentFrameId = frameTree.frame.parentId;
+        const owner =
+          this.findPageOwningFrame(childMainId) ??
+          (parentFrameId ? this.findPageOwningFrame(parentFrameId) : undefined);
+
+        if (owner) {
+          this.adoptOopif(owner, session, childMainId);
+          this.adoptPendingOopifsByParent();
+        } else {
+          this.pendingOopifByMainFrame.set(childMainId, sessionId);
+          if (parentFrameId) {
+            this.pendingOopifParentByMainFrame.set(childMainId, parentFrameId);
+          }
+        }
+      } catch {
+        this.disposePendingNetworkCapture(sessionId);
+      }
+    } finally {
+      await resume();
+    }
+  }
+
+  findPageOwningFrame(frameId: string): Page | undefined {
+    const known = this.frameOwnerPage.get(frameId);
+    if (known) {
+      if (
+        this.pagesByTarget.get(known.targetId()) === known &&
+        known.registry.frames.has(frameId)
+      ) {
+        return known;
+      }
+      this.frameOwnerPage.delete(frameId);
+    }
+    for (const p of this.pagesByTarget.values()) {
+      if (p.listAllFrameIds().includes(frameId)) return p;
+    }
+    return undefined;
+  }
+
+  adoptOopif(owner: Page, session: CdpSession, childMainId: string): void {
+    const pending = this.pendingNetworkCaptures.get(session.id);
+    this.pendingNetworkCaptures.delete(session.id);
+    try {
+      owner.adoptOopifSession(
+        session,
+        childMainId,
+        () => {
+          this.adoptPendingOopifsByParent();
+        },
+        pending?.capture,
+      );
+    } catch (error) {
+      pending?.capture.dispose();
+      throw error;
+    }
+    this.adoptedOopifSessionByFrame.set(childMainId, session.id);
+    this.sessionOwnerPage.set(session.id, owner);
+    this.frameOwnerPage.set(childMainId, owner);
+    this.installFrameEventBridges(session.id, owner);
+    void executionContexts.waitForMainWorld(session, childMainId).catch(() => {});
+  }
+
+  private disposePendingNetworkCapture(sessionId: SessionId): void {
+    this.pendingNetworkCaptures.get(sessionId)?.capture.dispose();
+    this.pendingNetworkCaptures.delete(sessionId);
+  }
+
+  private removePendingOopif(frameId: string): void {
+    this.pendingOopifByMainFrame.delete(frameId);
+    this.pendingOopifParentByMainFrame.delete(frameId);
+  }
+
+  private removePendingOopifsForPage(page: Page): void {
+    const pageFrameIds = new Set([page.mainFrameId(), ...page.registry.frames.keys()]);
+    for (const [frameId, owner] of this.frameOwnerPage) {
+      if (owner === page) pageFrameIds.add(frameId);
+    }
+
+    let removed: boolean;
+    do {
+      removed = false;
+      for (const [frameId] of this.pendingOopifByMainFrame) {
+        const parentId = this.pendingOopifParentByMainFrame.get(frameId);
+        if (!pageFrameIds.has(frameId) && (!parentId || !pageFrameIds.has(parentId))) continue;
+        pageFrameIds.add(frameId);
+        this.disposePendingNetworkCapture(this.pendingOopifByMainFrame.get(frameId)!);
+        this.removePendingOopif(frameId);
+        removed = true;
+      }
+    } while (removed);
+  }
+
+  /**
+   * An OOPIF that already existed when we attached (e.g. reconnecting to a live
+   * browser, or a nested OOPIF) never emits `frameAttached` on its parent, so the
+   * pending map would hold it forever. Adopt it once the page owning its parent is known.
+   */
+  adoptPendingOopifsByParent(): void {
+    let adopted = true;
+    while (adopted) {
+      adopted = false;
+      for (const [childMainId, parentFrameId] of Array.from(
+        this.pendingOopifParentByMainFrame.entries(),
+      )) {
+        const childSessionId = this.pendingOopifByMainFrame.get(childMainId);
+        const child = childSessionId ? this.conn.getSession(childSessionId) : undefined;
+        if (!child) {
+          if (childSessionId) this.disposePendingNetworkCapture(childSessionId);
+          this.removePendingOopif(childMainId);
+          continue;
+        }
+        const owner = this.findPageOwningFrame(parentFrameId);
+        if (!owner) continue;
+        this.removePendingOopif(childMainId);
+        this.adoptOopif(owner, child, childMainId);
+        adopted = true;
+      }
+    }
+  }
+
+  async closePopupIfBlockedByDomainPolicy(
+    info: Protocol.Target.TargetInfo,
+    source: "targetCreated" | "targetInfoChanged" | "attached",
+  ): Promise<boolean> {
+    if (!this.domainPolicy || !isTopLevelPage(info)) return false;
+    if (!info.openerId && !info.openerFrameId) return false;
+    if (this.domainPolicyClosingTargets.has(info.targetId)) return true;
+
+    const existingClose = this.domainPolicyClosePromises.get(info.targetId);
+    if (existingClose) {
+      return source === "attached" ? await existingClose : true;
+    }
+
+    const decision = getDomainPolicyDecision(info.url ?? "", this.domainPolicy);
+    if (decision.action === "continue") return false;
+
+    this.logger.debug("Closing popup targeting a disallowed domain", {
+      category: "network",
+      targetId: String(info.targetId),
+      targetUrl: String(info.url ?? ""),
+      openerId: String(info.openerId ?? ""),
+      openerFrameId: String(info.openerFrameId ?? ""),
+      ruleType: decision.reason,
+      source,
+    });
+
+    const closePromise = this.closeTargetAfterDomainPolicyViolation(info, {
+      failureMessage: "Failed to close popup after it reached a disallowed domain",
+    }).then((closed) => {
+      this.domainPolicyClosePromises.delete(info.targetId);
+      if (closed) {
+        this.domainPolicyClosingTargets.add(info.targetId);
+      }
+      return closed;
+    });
+    this.domainPolicyClosePromises.set(info.targetId, closePromise);
+    return await closePromise;
+  }
+
+  async closeTargetAfterDomainPolicyViolation(
+    info: Protocol.Target.TargetInfo,
+    opts: { failureMessage: string },
+  ): Promise<boolean> {
+    try {
+      await this.conn.send("Target.closeTarget", { targetId: info.targetId });
+      return true;
+    } catch (error) {
+      if (isMissingTargetError(error)) {
+        return true;
+      }
+
+      this.logger.error(opts.failureMessage, {
+        category: "network",
+        targetId: String(info.targetId),
+        targetType: String(info.type),
+        targetUrl: String(info.url ?? ""),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  onDetachedFromTarget(sessionId: SessionId, targetId: string | null): void {
+    this.disposePendingNetworkCapture(sessionId);
+    const closingPage = targetId ? this.pagesByTarget.get(targetId) : undefined;
+    if (closingPage) this.removePendingOopifsForPage(closingPage);
+
+    const owner = this.sessionOwnerPage.get(sessionId);
+    if (owner) {
+      owner.detachOopifSession(sessionId);
+      this.sessionOwnerPage.delete(sessionId);
+    }
+
+    if (targetId && this.pagesByTarget.has(targetId)) {
+      this.cleanupByTarget(targetId);
+    }
+
+    for (const [fid, sid] of Array.from(this.pendingOopifByMainFrame.entries())) {
+      if (sid === sessionId) this.removePendingOopif(fid);
+    }
+    for (const [fid, sid] of Array.from(this.adoptedOopifSessionByFrame.entries())) {
+      if (sid === sessionId) this.adoptedOopifSessionByFrame.delete(fid);
+    }
+
+    this._targetSessionListeners.delete(sessionId);
+    this._sessionInit.delete(sessionId);
+  }
+
+  cleanupByTarget(targetId: TargetId): void {
+    for (const [sessionId, pending] of this.pendingNetworkCaptures) {
+      if (pending.targetId === targetId) this.disposePendingNetworkCapture(sessionId);
+    }
+    this.recordPageCreationFailure(
+      targetId,
+      new Error(`Target closed before page registration (${targetId})`),
+      "Target closed before page registration",
+    );
+    const page = this.pagesByTarget.get(targetId);
+    if (!page) return;
+
+    this.removePendingOopifsForPage(page);
+    page.dispose();
+    const mainId = page.mainFrameId();
+    this.mainFrameToTarget.delete(mainId);
+    for (const [frameId, owner] of this.frameOwnerPage) {
+      if (owner === page) this.frameOwnerPage.delete(frameId);
+    }
+
+    for (const [sid, p] of Array.from(this.sessionOwnerPage.entries())) {
+      if (p === page) this.sessionOwnerPage.delete(sid);
+    }
+
+    this.pagesByTarget.delete(targetId);
+    this.createdAtByTarget.delete(targetId);
+    this.typeByTarget.delete(targetId);
+    this.pendingCreatedTargetUrl.delete(targetId);
+  }
+
+  private recordPageCreationFailure(
+    targetId: TargetId,
+    cause: unknown,
+    fallbackMessage: string,
+  ): void {
+    if (
+      !this.pendingInitialTopLevelTargets.has(targetId) &&
+      !this.pendingNewPageTargets.has(targetId)
+    ) {
+      return;
+    }
+    if (this.pageCreationFailures.has(targetId)) return;
+    this.pageCreationFailures.set(
+      targetId,
+      cause instanceof Error ? cause : new Error(`${fallbackMessage}: ${String(cause)}`),
+    );
+  }
+
+  installFrameEventBridges(sessionId: SessionId, owner: Page): void {
+    const session = this.conn.getSession(sessionId);
+    if (!session) return;
+
+    session.on<Protocol.Page.FrameAttachedEvent>("Page.frameAttached", (evt) => {
+      const { frameId, parentFrameId } = evt;
+
+      const adoptedSessionId = this.adoptedOopifSessionByFrame.get(frameId);
+      const adoptedSession = adoptedSessionId ? this.conn.getSession(adoptedSessionId) : undefined;
+      owner.onFrameAttached(frameId, parentFrameId ?? null, adoptedSession ?? session);
+
+      const pendingChildSessionId = this.pendingOopifByMainFrame.get(frameId);
+      if (pendingChildSessionId) {
+        const child = this.conn.getSession(pendingChildSessionId);
+        this.removePendingOopif(frameId);
+        if (child) this.adoptOopif(owner, child, frameId);
+      }
+
+      this.frameOwnerPage.set(frameId, owner);
+
+      if (!parentFrameId) {
+        const newRoot = owner.mainFrameId();
+        const topTargetId = this.findTargetIdByPage(owner);
+        if (topTargetId) {
+          this.mainFrameToTarget.set(newRoot, topTargetId);
+        }
+        this.frameOwnerPage.set(newRoot, owner);
+      }
+
+      this.adoptPendingOopifsByParent();
+    });
+
+    session.on<Protocol.Page.FrameDetachedEvent>("Page.frameDetached", (evt) => {
+      owner.onFrameDetached(evt.frameId, evt.reason ?? "remove");
+      if (evt.reason !== "swap") {
+        this.frameOwnerPage.delete(evt.frameId);
+      }
+    });
+
+    session.on<Protocol.Page.FrameNavigatedEvent>("Page.frameNavigated", (evt) => {
+      owner.onFrameNavigated(evt.frame, session);
+    });
+
+    session.on<Protocol.Page.NavigatedWithinDocumentEvent>(
+      "Page.navigatedWithinDocument",
+      (evt) => {
+        owner.onNavigatedWithinDocument(evt.frameId, evt.url, session);
+      },
+    );
+  }
+
+  wireSessionToOwnerPage(sessionId: SessionId, owner: Page): void {
+    this.sessionOwnerPage.set(sessionId, owner);
+  }
+
+  findTargetIdByPage(page: Page): TargetId | undefined {
+    for (const [tid, p] of this.pagesByTarget) {
+      if (p === page) return tid;
+    }
+    return undefined;
+  }
+
+  async cookies(urls?: string | string[]): Promise<Cookie[]> {
+    const urlList = !urls ? [] : typeof urls === "string" ? [urls] : urls;
+
+    const { cookies } = await this.conn.send<{
+      cookies: Protocol.Network.Cookie[];
+    }>("Storage.getCookies");
+
+    const mapped: Cookie[] = cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      expires: c.expires,
+      httpOnly: c.httpOnly,
+      secure: c.secure,
+      sameSite: (c.sameSite as Cookie["sameSite"]) ?? "Lax",
+    }));
+
+    return filterCookies(mapped, urlList);
+  }
+
+  async addCookies(cookies: CookieParam[]): Promise<void> {
+    const normalized = normalizeCookieParams(cookies);
+    if (!normalized.length) return;
+
+    const cdpCookies = normalized.map(toCdpCookieParam);
+
+    await this.conn.send("Storage.setCookies", { cookies: cdpCookies });
+  }
+
+  async clearCookies(options?: UnderstudyClearCookieOptions): Promise<void> {
+    const hasFilter =
+      options?.name !== undefined || options?.domain !== undefined || options?.path !== undefined;
+
+    if (!hasFilter) {
+      await this.conn.send("Storage.clearCookies");
+      return;
+    }
+
+    const current = await this.cookies();
+    const toKeep = current.filter((c) => !cookieMatchesFilter(c, options!));
+
+    if (toKeep.length === current.length) return;
+
+    // Storage domain doesn't support targeted deletes on the browser endpoint.
+    // Clear everything, then re-add only the cookies we're keeping.
+    await this.conn.send("Storage.clearCookies");
+    if (toKeep.length) {
+      await this.conn.send("Storage.setCookies", {
+        cookies: toKeep.map(toCdpCookieParam),
+      });
+    }
+  }
+}

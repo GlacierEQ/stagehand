@@ -1,6 +1,6 @@
 import path from "path";
 import type { Testcase, EvalInput, AgentModelEntry } from "../types/evals.js";
-import type { AvailableModel } from "@browserbasehq/stagehand";
+import type { AvailableModel } from "stagehand-v3";
 import { tasksConfig } from "../taskConfig.js";
 import { getPackageRootDir } from "../runtimePaths.js";
 import {
@@ -10,9 +10,7 @@ import {
   normalizeAgentModelEntries,
 } from "../utils.js";
 
-export const buildWebVoyagerTestcases = (
-  models: string[] | AgentModelEntry[],
-): Testcase[] => {
+export const buildWebVoyagerTestcases = (models: string[] | AgentModelEntry[]): Testcase[] => {
   const voyagerFilePath = path.join(
     getPackageRootDir(),
     "datasets",
@@ -22,7 +20,6 @@ export const buildWebVoyagerTestcases = (
 
   const lines = readJsonlFile(voyagerFilePath);
 
-  // Use EVAL_MAX_K if set, otherwise fall back to EVAL_WEBVOYAGER_LIMIT or default to 25
   const maxCases = process.env.EVAL_MAX_K
     ? Number(process.env.EVAL_MAX_K)
     : process.env.EVAL_WEBVOYAGER_LIMIT
@@ -44,9 +41,7 @@ export const buildWebVoyagerTestcases = (
     if (parsed === null || typeof parsed !== "object") return false;
     const obj = parsed as Record<string, unknown>;
     return (
-      typeof obj.id === "string" &&
-      typeof obj.web === "string" &&
-      typeof obj.ques === "string"
+      typeof obj.id === "string" && typeof obj.web === "string" && typeof obj.ques === "string"
     );
   }
 
@@ -68,16 +63,11 @@ export const buildWebVoyagerTestcases = (
           web_name: row.web_name,
         },
       };
-      const taskCategories =
-        tasksConfig.find((t) => t.name === input.name)?.categories || [];
+      const taskCategories = tasksConfig.find((t) => t.name === input.name)?.categories || [];
       allTestcases.push({
         input,
         name: input.name,
-        tags: [
-          modelEntry.modelName,
-          modelEntry.mode,
-          "webvoyager", // Simple dataset tag
-        ],
+        tags: [modelEntry.modelName, modelEntry.mode, "webvoyager"],
         metadata: {
           model: modelEntry.modelName as AvailableModel,
           test: `${input.name}:${row.id}`,
